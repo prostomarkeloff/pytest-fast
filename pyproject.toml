@@ -1,6 +1,6 @@
 [project]
 name = "pytest-fast"
-version = "0.5.0"
+version = "0.5.1"
 description = "Resident forkserver-based pytest accelerator — collect once, fork warm workers, idempotently respawn on source/env change. POSIX only (uses forkserver)."
 authors = [
     { name = "prostomarkeloff", email = "prostomarkeloff@ohreally.me" }
