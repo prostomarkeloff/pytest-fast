@@ -1,4 +1,4 @@
-"""Tests for `_env_fingerprint` and `_watch_roots` — daemon staleness logic.
+"""Tests for `_env_fingerprint`, `_watch_dirs`, `_watch_files` — daemon staleness logic.
 
 The stale check has TWO axes: source mtime and env fingerprint. This file covers
 the second one (mtime is in test_paths.py). Both must work together: a change to a
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pytest_fast import _env_fingerprint, _watch_roots
+from pytest_fast import _env_fingerprint, _watch_dirs, _watch_files
 
 if TYPE_CHECKING:
     import pytest
@@ -72,33 +72,64 @@ def test_fingerprint_changes_on_prefix_list_itself(monkeypatch: pytest.MonkeyPat
     assert fp_before != fp_after
 
 
-def test_watch_roots_default_includes_src_and_tests(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("PYTEST_FAST_WATCH", raising=False)
-    roots = _watch_roots()
-    assert "src" in roots
-    assert "tests" in roots
+def test_fingerprint_changes_on_watch_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PYTEST_FAST_WATCH_DIRS determines what's scanned — a change must respawn."""
+    monkeypatch.delenv("PYTEST_FAST_WATCH_DIRS", raising=False)
+    fp_before = _env_fingerprint()
+    monkeypatch.setenv("PYTEST_FAST_WATCH_DIRS", "mypkg,tests")
+    fp_after = _env_fingerprint()
+    assert fp_before != fp_after
 
 
-def test_watch_roots_extras_via_env_comma(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PYTEST_FAST_WATCH", "engine,shim")
-    roots = _watch_roots()
-    assert "engine" in roots
-    assert "shim" in roots
+def test_fingerprint_changes_on_watch_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PYTEST_FAST_WATCH_FILES determines which config files trigger respawn — a change must respawn."""
+    monkeypatch.delenv("PYTEST_FAST_WATCH_FILES", raising=False)
+    fp_before = _env_fingerprint()
+    monkeypatch.setenv("PYTEST_FAST_WATCH_FILES", "setup.cfg,tox.ini")
+    fp_after = _env_fingerprint()
+    assert fp_before != fp_after
 
 
-def test_watch_roots_extras_via_env_colon(monkeypatch: pytest.MonkeyPatch) -> None:
+# ── _watch_dirs ──────────────────────────────────────────────────────────────
+
+
+def test_watch_dirs_default_is_src_and_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PYTEST_FAST_WATCH_DIRS", raising=False)
+    assert _watch_dirs() == ["src", "tests"]
+
+
+def test_watch_dirs_env_replaces_default_comma(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REPLACE semantics: env var fully replaces the default (does not add to it)."""
+    monkeypatch.setenv("PYTEST_FAST_WATCH_DIRS", "mypkg,integration")
+    assert _watch_dirs() == ["mypkg", "integration"]
+
+
+def test_watch_dirs_env_replaces_default_colon(monkeypatch: pytest.MonkeyPatch) -> None:
     """`:` separator is supported alongside `,` (PATH-style)."""
-    monkeypatch.setenv("PYTEST_FAST_WATCH", "engine:shim")
-    roots = _watch_roots()
-    assert "engine" in roots
-    assert "shim" in roots
+    monkeypatch.setenv("PYTEST_FAST_WATCH_DIRS", "mypkg:integration")
+    assert _watch_dirs() == ["mypkg", "integration"]
 
 
-def test_watch_roots_no_duplicates_against_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """If PYTEST_FAST_WATCH repeats `src`, we don't duplicate (the mtime scan loop
-    would enter the same dir twice, semantically pointless)."""
-    monkeypatch.setenv("PYTEST_FAST_WATCH", "src,tests,engine")
-    roots = _watch_roots()
-    assert roots.count("src") == 1
-    assert roots.count("tests") == 1
-    assert "engine" in roots
+def test_watch_dirs_empty_env_yields_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit empty value scans nothing — occasionally useful for tooling."""
+    monkeypatch.setenv("PYTEST_FAST_WATCH_DIRS", "")
+    assert _watch_dirs() == []
+
+
+# ── _watch_files ─────────────────────────────────────────────────────────────
+
+
+def test_watch_files_default_is_pyproject_and_pytest_ini(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PYTEST_FAST_WATCH_FILES", raising=False)
+    assert _watch_files() == ["pyproject.toml", "pytest.ini"]
+
+
+def test_watch_files_env_replaces_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REPLACE semantics: e.g. tox-using project sets `tox.ini,setup.cfg`."""
+    monkeypatch.setenv("PYTEST_FAST_WATCH_FILES", "tox.ini,setup.cfg,conftest.py")
+    assert _watch_files() == ["tox.ini", "setup.cfg", "conftest.py"]
+
+
+def test_watch_files_empty_env_yields_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYTEST_FAST_WATCH_FILES", "")
+    assert _watch_files() == []

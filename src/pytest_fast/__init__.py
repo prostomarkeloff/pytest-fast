@@ -807,18 +807,30 @@ def request_run(address: str) -> dict[str, object]:
 # ── orchestration: ensure resident daemon + run / stale-restart ──────────────
 
 
-def _watch_roots() -> list[str]:
-    """Dirs whose `*.py` mtimes drive staleness. Base `src`/`tests` are ALWAYS
-    watched (dropping them would silently run stale code); `PYTEST_FAST_WATCH`
-    (comma/colon-separated, repo-relative) ADDS more — e.g. an out-of-tree shim
-    or engine dir you're iterating on, so editing it auto-restarts the daemon."""
-    roots = ["src", "tests"]
-    extra = os.environ.get("PYTEST_FAST_WATCH", "")
-    for part in extra.replace(":", ",").split(","):
-        part = part.strip()
-        if part and part not in roots:
-            roots.append(part)
-    return roots
+def _split_env_list(name: str, default: list[str]) -> list[str]:
+    """Parse a comma/colon-separated env var into a list, falling back to `default`
+    when unset. PATH-style semantics: env REPLACES the default (does not add to it).
+    An explicit empty value (`PYTEST_FAST_WATCH_DIRS=""`) yields an empty list — that
+    is, "scan nothing", which is occasionally useful for tooling."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return [p.strip() for p in raw.replace(":", ",").split(",") if p.strip()]
+
+
+def _watch_dirs() -> list[str]:
+    """Dirs scanned recursively for `*.py` mtime. Default `src,tests`.
+    `PYTEST_FAST_WATCH_DIRS` (comma/colon-separated, repo-relative) REPLACES the
+    default — e.g. a flat-layout project sets `PYTEST_FAST_WATCH_DIRS=mypkg,tests`."""
+    return _split_env_list("PYTEST_FAST_WATCH_DIRS", ["src", "tests"])
+
+
+def _watch_files() -> list[str]:
+    """Standalone config files included in the mtime scan (repo-relative). Default
+    `pyproject.toml,pytest.ini`. `PYTEST_FAST_WATCH_FILES` (comma/colon-separated)
+    REPLACES the default — add `setup.cfg`, `tox.ini`, `conftest.py`, etc. as your
+    project needs."""
+    return _split_env_list("PYTEST_FAST_WATCH_FILES", ["pyproject.toml", "pytest.ini"])
 
 
 def _project_root() -> Path:
@@ -831,21 +843,21 @@ def _project_root() -> Path:
 
 
 def _iter_source_paths() -> Iterator[Path]:
-    """All files under watch roots + config — a single traversal point for both
+    """All files under watch dirs + watch files — a single traversal point for both
     `_max_source_mtime` (which needs max) and `_any_source_newer` (which needs early-exit)."""
     root = _project_root()
-    for name in _watch_roots():
+    for name in _watch_dirs():
         base = root / name
         yield from base.rglob("*.py")
-    yield root / "pyproject.toml"
-    yield root / "pytest.ini"
+    for name in _watch_files():
+        yield root / name
 
 
 def _max_source_mtime() -> float:
-    """max(mtime) over watch roots (src/tests + PYTEST_FAST_WATCH) + config — cheaply
-    detects code changes. At boot/watcher we need the actual MAX (cached as baseline
-    and polled). For the stale check in the hot path we use `_any_source_newer` —
-    it short-circuits on the first newer file."""
+    """max(mtime) over watch dirs + watch files — cheaply detects code/config changes.
+    At boot/watcher we need the actual MAX (cached as baseline and polled). For the
+    stale check in the hot path we use `_any_source_newer` — it short-circuits on
+    the first newer file."""
     latest = 0.0
     for p in _iter_source_paths():
         try:
@@ -881,7 +893,8 @@ _FINGERPRINT_KEYS = (
     "PYTEST_FAST_MARK",
     "PYTEST_ADDOPTS",
     "OUTCOME_DUMP",
-    "PYTEST_FAST_WATCH",
+    "PYTEST_FAST_WATCH_DIRS",
+    "PYTEST_FAST_WATCH_FILES",
     "PYTEST_FAST_ROOT",
     "PYTEST_FAST_ENV_PREFIXES",  # change in the prefix list itself must respawn too
 )

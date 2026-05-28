@@ -133,7 +133,7 @@ Each worker is a `fork()` out of the forkserver — **copy-on-write**, so the te
 
 A warm daemon is wrong if:
 
-1. **Source files changed** — `max(mtime)` of `src/`, `tests/`, `pyproject.toml`, `pytest.ini` (plus anything in `PYTEST_FAST_WATCH`) is compared against the snapshot taken at boot. Implemented via early-exit `_any_source_newer(threshold)` so on large repos a single newer file short-circuits the scan.
+1. **Source files changed** — `max(mtime)` of dirs in `PYTEST_FAST_WATCH_DIRS` (default `src,tests`) plus files in `PYTEST_FAST_WATCH_FILES` (default `pyproject.toml,pytest.ini`) is compared against the snapshot taken at boot. Both env vars use PATH-style REPLACE semantics — set them to whatever your project needs (flat layouts, `setup.cfg`, `tox.ini`, etc.). Implemented via early-exit `_any_source_newer(threshold)` so on large repos a single newer file short-circuits the scan.
 
 2. **Relevant env changed** — `PYTEST_ADDOPTS`, `PYTEST_FAST_*`, and any prefix you list in `PYTEST_FAST_ENV_PREFIXES` (e.g. `MYAPP_,FEATURE_`) are hashed into an env fingerprint. The client sends its current fp on every request; the daemon compares against its boot fp.
 
@@ -181,20 +181,93 @@ If you need junit XML, allure, html reports, or you run on Windows — stay on x
 
 ---
 
-## Configuration
+## Environment variables
 
-All env-driven. No config file.
+`pytest-fast` is configured entirely via env vars — no config file. Everything
+relevant is in the table below; the rest of this section walks through what each
+knob does and a few common project layouts.
 
-| Env | Default | What |
-|---|---|---|
-| `PYTEST_FAST_MARK` | `""` (no filter) | Marker expression passed to pytest as `-m` |
-| `PYTEST_ADDOPTS` | (inherited) | Standard pytest addopts; in the fingerprint |
-| `PYTEST_FAST_ROOT` | `os.getcwd()` | Root for source-mtime scanning (override for non-cwd projects) |
-| `PYTEST_FAST_WATCH` | `src,tests` | Comma/colon-separated dirs to add to the mtime scan |
-| `PYTEST_FAST_ENV_PREFIXES` | `""` | Comma-separated env-var prefixes whose change must force respawn (e.g. `MYAPP_,FEATURE_`) |
-| `OUTCOME_DUMP` | `""` | Path to write `{nodeid: outcome}` JSON (plugin mode, for outcome-diff vs xdist) |
+### Reference
 
-CLI flags:
+| Variable | Default | Semantics | What it does |
+|---|---|---|---|
+| `PYTEST_FAST_ROOT` | `os.getcwd()` | absolute or relative path | Project root for the mtime scan. Override when launching pytest-fast outside the repo root, or for isolated test runs. |
+| `PYTEST_FAST_WATCH_DIRS` | `src,tests` | comma/colon, **REPLACE** | Dirs scanned recursively for `*.py` mtime. Env REPLACES the default — flat-layout projects set `mypkg,tests`. Empty value scans no dirs. |
+| `PYTEST_FAST_WATCH_FILES` | `pyproject.toml,pytest.ini` | comma/colon, **REPLACE** | Standalone config files included in the mtime scan. REPLACES the default — add `setup.cfg`, `tox.ini`, root `conftest.py`, etc. as your project needs. |
+| `PYTEST_FAST_MARK` | `""` (no filter) | string | Pytest marker expression. Passed as `-m` during collection (`pytest_fast -m "not slow"` equivalent). |
+| `PYTEST_ADDOPTS` | (inherited) | pytest opts | Standard pytest addopts. Included in the env fingerprint so a change forces respawn. |
+| `PYTEST_FAST_ENV_PREFIXES` | `""` | comma-separated | Env-var prefixes whose change must force respawn. Use this to mark your app config — `MYAPP_,FEATURE_` covers `MYAPP_DB_HOST=...` and `FEATURE_X=...` shifts. |
+| `OUTCOME_DUMP` | `""` | path | When set, the `-p pytest_fast` plugin mode writes `{nodeid: outcome}` JSON on `pytest_sessionfinish` — useful as a reference dump for outcome-diff against xdist. |
+
+All variables listed are in the env fingerprint. A change to any of them forces
+the daemon to exit and the client to spawn a fresh one (with the new env baked
+in). You never need to manually kill a daemon.
+
+### Watch-set: what triggers re-collect
+
+The two `WATCH_*` vars together define **"a change to any of these files invalidates
+the warm daemon"**. PATH-style REPLACE semantics: set them and they completely
+override the defaults, not append.
+
+```bash
+# Flat layout — package directly under repo root
+PYTEST_FAST_WATCH_DIRS=mypkg,tests
+
+# Mono-repo with multiple packages
+PYTEST_FAST_WATCH_DIRS=services/api/src,services/worker/src,tests
+
+# Tox-using project — extra config files
+PYTEST_FAST_WATCH_FILES=pyproject.toml,pytest.ini,tox.ini,setup.cfg
+
+# Conftest-heavy project — also re-collect when root conftest changes
+PYTEST_FAST_WATCH_FILES=pyproject.toml,pytest.ini,conftest.py
+
+# Scan nothing (advanced; daemon will never go stale on source — useful when
+# the only thing that should drive respawn is PYTEST_FAST_ENV_PREFIXES)
+PYTEST_FAST_WATCH_DIRS=
+PYTEST_FAST_WATCH_FILES=
+```
+
+### App-config invalidation: `PYTEST_FAST_ENV_PREFIXES`
+
+The daemon caches your app-graph **as imported at boot**. If your app reads
+`MYAPP_DB_HOST` at import time and you flip it, the warm daemon would run tests
+against the old config. `PYTEST_FAST_ENV_PREFIXES` tells pytest-fast which env
+prefixes should drive a respawn:
+
+```bash
+# Single app prefix
+PYTEST_FAST_ENV_PREFIXES=MYAPP_
+
+# Multiple prefixes
+PYTEST_FAST_ENV_PREFIXES=MYAPP_,FEATURE_,DATABASE_
+
+# Now any of these flips forces respawn:
+MYAPP_DB_HOST=prod   pytest-fast --address /tmp/s.sock   # boots daemon A
+MYAPP_DB_HOST=stage  pytest-fast --address /tmp/s.sock   # → fp mismatch → daemon A exits, daemon B boots
+```
+
+Without `PYTEST_FAST_ENV_PREFIXES`, only the keys in the explicit whitelist
+(`PYTEST_ADDOPTS`, `PYTEST_FAST_*`, `OUTCOME_DUMP`, `PYTEST_FAST_MARK`) drive
+staleness — random shell vars don't.
+
+### Putting it together
+
+A FastAPI project with `app/` and `tests/` layout, SQLAlchemy + Pydantic, using `tox.ini`:
+
+```bash
+export PYTEST_FAST_WATCH_DIRS=app,tests
+export PYTEST_FAST_WATCH_FILES=pyproject.toml,pytest.ini,tox.ini
+export PYTEST_FAST_ENV_PREFIXES=APP_,DB_
+
+# Now any of these triggers respawn automatically:
+#   - edit app/**/*.py or tests/**/*.py
+#   - edit pyproject.toml / pytest.ini / tox.ini
+#   - flip APP_DEBUG or DB_HOST
+pytest-fast --address /tmp/myapp.sock --workers 6
+```
+
+### CLI flags
 
 ```
 --address PATH       Unix socket of the resident daemon (caller picks the path)
