@@ -394,6 +394,19 @@ def _run_one_item(item: Item, nextitem: Item | None, collector: _ReportCollector
     return result
 
 
+def _worker_hang_timeout() -> float:
+    """Seconds after which a worker still running a single test dumps all-threads stack
+    traces to stderr (which lands in the daemon log). Diagnoses runaway tests / GIL
+    deadlocks / blocked I/O inside `pytest_runtest_protocol`. 0 = disabled (default,
+    so legitimately-slow tests don't dump on every run); typical opt-in is 60–120s.
+
+    Env var: `PYTEST_FAST_WORKER_HANG_TIMEOUT=<seconds>`."""
+    try:
+        return max(0.0, float(os.environ.get("PYTEST_FAST_WORKER_HANG_TIMEOUT", "0")))
+    except ValueError:
+        return 0.0
+
+
 def _worker_main(wid: int, sock_path: str) -> None:
     # IMPORTANT: read globals via `import pytest_fast`, NOT as bare names. `_collect()`
     # set them on the PRELOADED "pytest_fast" module (forkserver) / at import (spawn),
@@ -412,6 +425,20 @@ def _worker_main(wid: int, sock_path: str) -> None:
     sock.connect(sock_path)
     _send(sock, ("ready", wid, len(items), collect_wall))
 
+    # Per-test hang watchdog: when `PYTEST_FAST_WORKER_HANG_TIMEOUT` > 0, arm a
+    # `faulthandler` timer before each `_run_one_item` and cancel it after the test
+    # returns. If a test exceeds the timeout, faulthandler dumps all-threads tracebacks
+    # to stderr (→ daemon log in resident mode) AND prints the nodeid we were running,
+    # so a deadlock pinpoints the offending test instead of presenting as silent hang.
+    hang_timeout = _worker_hang_timeout()
+    faulthandler_mod = None
+    if hang_timeout > 0:
+        import faulthandler
+
+        faulthandler_mod = faulthandler
+        if not faulthandler.is_enabled():
+            faulthandler.enable()
+
     run_start = time.perf_counter()
     busy = 0.0
     ran = 0
@@ -425,7 +452,25 @@ def _worker_main(wid: int, sock_path: str) -> None:
         cur = items[idx] if isinstance(idx, int) else None
         if prev is not None:
             t0 = time.perf_counter()
-            pending = _run_one_item(prev, cur, collector)
+            if faulthandler_mod is not None:
+                faulthandler_mod.dump_traceback_later(hang_timeout, repeat=True, exit=False)
+            try:
+                pending = _run_one_item(prev, cur, collector)
+            except BaseException:
+                if faulthandler_mod is not None:
+                    faulthandler_mod.cancel_dump_traceback_later()
+                # Worker died mid-test (runtime error in the protocol itself, NOT a test
+                # failure — those are captured as reports). Print the offending nodeid
+                # so the daemon log shows which test we were on, then re-raise so the
+                # process exits with non-zero and the master flags the run untrusted.
+                print(
+                    f"[pytest-fast] worker {wid} crashed while running {prev.nodeid!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
+            if faulthandler_mod is not None:
+                faulthandler_mod.cancel_dump_traceback_later()
             busy += time.perf_counter() - t0
             ran += 1
         else:
@@ -436,6 +481,16 @@ def _worker_main(wid: int, sock_path: str) -> None:
             break
         prev = cur
     sock.close()
+    # Worker exit: `os._exit(0)` — skip atexit hooks AND non-daemon thread joins.
+    # Returning normally would let interpreter shutdown join() every alive non-daemon
+    # thread; tests that spawn worker threads (intentionally — `test_run_given_concurrently`
+    # — or unintentionally — pytest's threadexception plugin warning on an orphan thread)
+    # leave those threads alive, and the worker would never exit → `procs[wid].join()` in
+    # master hangs forever, presenting as a silent post-`F` deadlock. We've already sent
+    # `fin` and closed the bus socket, so a hard exit is correct (the master got every
+    # report; nothing else legitimate is pending). Mirrors stdlib multiprocessing's own
+    # advice for worker children whose application code may leave threads running.
+    os._exit(0)
 
 
 # ── reference outcome-dump (when loaded as `-p pytest_fast` with OUTCOME_DUMP) ─
@@ -614,8 +669,22 @@ class Daemon:
         try:
             results, worker_stats, bus, t_ready, total = self._serve_bus(server, progress_conn)
         finally:
+            # Bounded join: a healthy worker exits within milliseconds of sending `fin`
+            # (it calls `os._exit(0)`). If join exceeds the budget, the worker is wedged
+            # (rare — non-daemon thread the `os._exit` guard missed, or a crash before
+            # the exit call) and we kill it rather than wait forever. The bus has already
+            # closed; nothing more is pending from a wedged worker.
             for p in procs:
-                p.join()
+                p.join(timeout=_WORKER_JOIN_TIMEOUT)
+                if p.is_alive():
+                    print(
+                        f"[pytest-fast] worker pid={p.pid} did not exit within "
+                        f"{_WORKER_JOIN_TIMEOUT}s after fin — killing",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    p.kill()
+                    p.join(timeout=1.0)
             server.close()
             Path(sock_path).unlink(missing_ok=True)
         t_done = time.perf_counter()
@@ -1235,6 +1304,7 @@ _DEBOUNCE_POLL_INTERVAL = 0.1
 
 # Network/IPC timeouts.
 _WORKER_ACCEPT_TIMEOUT = 60.0  # seconds for each worker's connect to the master server
+_WORKER_JOIN_TIMEOUT = 10.0  # seconds master waits for a worker process to exit after `fin`
 _STATUS_PING_TIMEOUT = 2.0  # seconds for a status ping; a daemon busy with a run isn't in accept
 _PROGRESS_THROTTLE_SEC = 0.1  # 10 frames/s; the final frame is force-flushed anyway
 
