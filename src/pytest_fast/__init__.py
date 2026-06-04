@@ -22,8 +22,16 @@ Modes (CLI `pytest-fast` or `python -m pytest_fast`):
         verify collect, soft-shutdown the old one, promote to canonical). Exits once
         the daemon is gone via its own idle-ttl. Single-instance via flock.
   * `--runs N` / `--dump PATH`:     local in-process run.
-  * `-p pytest_fast` (as a plugin): when OUTCOME_DUMP is set, writes {nodeid: outcome} —
-        a reference dump for outcome-diff comparison against xdist.
+
+Also a pytest plugin (auto-loaded via the `pytest11` entry point):
+  * `pytest --fast`:                run the suite through the resident daemon while staying a
+        real pytest session — the daemon streams full per-phase reports, which we republish
+        through the controller's hooks → fully NATIVE reporting (terminalreporter, --durations,
+        -v/-s, junit, plugins, exit code) on top of warm fork-server execution. Forwards the
+        collected selection (-k/-m). `--fast-address/-workers/-ttl/-watch` tune it. Inert
+        unless `--fast` is passed (so a plain `pytest` run is unaffected).
+  * `OUTCOME_DUMP=PATH pytest -p pytest_fast`: writes {nodeid: outcome} — a reference dump for
+        outcome-diff comparison against xdist.
 
 Behaviorally identical to xdist (same test set; marks/skip/xfail/reruns 1-to-1 —
 runs go through the FULL pytest protocol `pytest_runtest_protocol`); reports are lossy.
@@ -62,10 +70,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from multiprocessing.context import DefaultContext
 
     from _pytest.config import Config
+    from _pytest.config.argparsing import Parser
+    from _pytest.main import Session
     from _pytest.nodes import Item
     from _pytest.reports import TestReport
 
@@ -81,6 +91,7 @@ __all__ = [
     "main",
     "main_cli",
     "request_run",  # client-side, module-level
+    "request_run_streamed",  # client-side streaming (used by the --fast plugin controller)
 ]
 
 
@@ -91,6 +102,10 @@ class RunResult(TypedDict):
     outcome: str
     duration: float
     longrepr: NotRequired[str]  # failure text — only for failed/error
+    # Every phase report in pytest's serializable wire form (plain builtins, whitelist-safe),
+    # present only in full-report mode — lets the master/controller replay them through a real
+    # terminalreporter (--durations, junit, -v/-s, plugins). See `_run_one_item(full_report=...)`.
+    reports: NotRequired[list[dict[str, object]]]
 
 
 class WorkerStats(TypedDict):
@@ -159,9 +174,10 @@ def _short_unix_path(address: str) -> Iterator[str]:
 
 # Hard cap on a single frame (header is uint32, uncapped that's up to 4GB). A corrupted
 # or malicious frame with a huge `length` → an attempt to allocate gigabytes inside
-# `_recvn`. Real max traffic: a longrepr failure text can be chunky but not megabytes;
-# 64MB is generous headroom for the most pathological tracebacks.
-_MAX_FRAME_BYTES = 64 * 1024 * 1024
+# `_recvn`. In full-report mode whole serialized TestReports ride the bus (longrepr +
+# captured stdout/stderr/log sections), so a single test that prints a lot can produce a
+# chunky frame; 256MB is generous headroom while still bounding a corrupt/hostile header.
+_MAX_FRAME_BYTES = 256 * 1024 * 1024
 
 
 # Whitelist for `_SafeUnpickler.find_class`. Our wire protocol carries:
@@ -390,9 +406,35 @@ def _failure_text(reports: list[TestReport]) -> str:
     return "\n".join(parts)
 
 
-def _run_one_item(item: Item, nextitem: Item | None, collector: _ReportCollector) -> RunResult:
+def _durations_lines(results: list[RunResult], limit: int = 15, min_dur: float = 0.005) -> list[str]:
+    """A pytest `--durations`-style table from the full per-phase reports (full-report mode
+    only). Flattens every (duration, when, nodeid) phase across all results, slowest first.
+    Empty when no result carries serialized reports (lean mode)."""
+    phases: list[tuple[float, str, str]] = []
+    for r in results:
+        for rep in r.get("reports", []):
+            dur, when, nodeid = rep.get("duration"), rep.get("when"), rep.get("nodeid")
+            if isinstance(dur, int | float) and isinstance(when, str) and isinstance(nodeid, str):
+                phases.append((float(dur), when, nodeid))
+    phases.sort(reverse=True)
+    shown = [p for p in phases if p[0] >= min_dur][:limit]
+    if not shown:
+        return []
+    out = [f"  DURATIONS (top {len(shown)}, ≥{min_dur * 1000:.0f}ms — per phase):"]
+    out.extend(f"    {dur:8.3f}s  {when:<9}{nodeid}" for dur, when, nodeid in shown)
+    return out
+
+
+def _run_one_item(
+    item: Item, nextitem: Item | None, collector: _ReportCollector, *, full_report: bool = False
+) -> RunResult:
     """Run a test via the FULL pytest protocol (hook, not function): setup/call/
-    teardown, capture, rerunfailures, makereport — behavior 1-to-1 with regular pytest."""
+    teardown, capture, rerunfailures, makereport — behavior 1-to-1 with regular pytest.
+
+    `full_report=True` also attaches every phase report in pytest's serializable wire form
+    (`pytest_report_to_serializable` → plain builtins, whitelist-safe) so the master/controller
+    can replay them through a real terminalreporter (--durations, junit, -v/-s, plugins). Off by
+    default — the lean path ships only the outcome summary."""
     collector.reports.clear()
     item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
     duration = sum(r.duration for r in collector.reports)
@@ -400,6 +442,12 @@ def _run_one_item(item: Item, nextitem: Item | None, collector: _ReportCollector
     result: RunResult = {"nodeid": item.nodeid, "outcome": outcome, "duration": duration}
     if outcome in {"failed", "error"}:
         result["longrepr"] = _failure_text(collector.reports)  # traceback only for reds
+    if full_report:
+        config = item.config
+        result["reports"] = [
+            cast("dict[str, object]", config.hook.pytest_report_to_serializable(config=config, report=rep))
+            for rep in collector.reports
+        ]
     return result
 
 
@@ -416,7 +464,7 @@ def _worker_hang_timeout() -> float:
         return 0.0
 
 
-def _worker_main(wid: int, sock_path: str) -> None:
+def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodeids: bool = False) -> None:
     # IMPORTANT: read globals via `import pytest_fast`, NOT as bare names. `_collect()`
     # set them on the PRELOADED "pytest_fast" module (forkserver) / at import (spawn),
     # whereas `_worker_main`'s own globals are __main__/__mp_main__ (collect did NOT run there).
@@ -432,7 +480,10 @@ def _worker_main(wid: int, sock_path: str) -> None:
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)
-    _send(sock, ("ready", wid, len(items), collect_wall))
+    # In selection mode the master needs nodeid→index to run a subset; ship the nodeid list
+    # once per worker in 'ready' (None otherwise → lean).
+    ready_nodeids = [it.nodeid for it in items] if send_nodeids else None
+    _send(sock, ("ready", wid, len(items), collect_wall, ready_nodeids))
 
     # Per-test hang watchdog: when `PYTEST_FAST_WORKER_HANG_TIMEOUT` > 0, arm a
     # `faulthandler` timer before each `_run_one_item` and cancel it after the test
@@ -468,7 +519,7 @@ def _worker_main(wid: int, sock_path: str) -> None:
             if faulthandler_mod is not None:
                 faulthandler_mod.dump_traceback_later(hang_timeout, repeat=True, exit=False)
             try:
-                pending = _run_one_item(prev, cur, collector)
+                pending = _run_one_item(prev, cur, collector, full_report=full_report)
             except BaseException:
                 if faulthandler_mod is not None:
                     faulthandler_mod.cancel_dump_traceback_later()
@@ -564,11 +615,11 @@ class Daemon:
 
     # ── public modes ─────────────────────────────────────────────────────────
 
-    def run(self, runs: int) -> int:
+    def run(self, runs: int, *, full_report: bool = False) -> int:
         """Local mode: single-shot (runs=1) or N runs in one process."""
         rc = 0
         for _ in range(runs):
-            rc, summary = self._run_once()
+            rc, summary = self._run_once(full_report=full_report)
             print(summary)
         return rc
 
@@ -650,16 +701,30 @@ class Daemon:
                         _send(conn, {"promoted": True})
                         _log("daemon", f"promoted → listening {cur}")
                         continue
-                    # default — this is a run request
+                    # default — this is a run request: ('run', fp[, full_report])
                     reason = _stale_reason(boot_mtime, boot_fp, client_fp)
                     if reason is not None:
                         _log("daemon", f"{reason} — exiting stale")
                         _send(conn, {"stale": True})
                         return 0  # finally releases the socket → client spawns a fresh daemon
-                    # progress_conn=conn: workers write dots into the DAEMON log, not the client's
-                    # terminal — so we stream progress over this same socket (otherwise the client
-                    # sits silent the whole run and looks frozen).
-                    rc, summary = self._run_once(progress_conn=conn)
+                    # Optional args: ('run', fp, full_report[, stream[, nodeids]]). Old clients send
+                    # only fp → lean. `stream` (the plugin controller) asks the daemon to stream the
+                    # serialized per-phase reports back; `nodeids` (the controller's collected set)
+                    # restricts the run to that selection.
+                    full_report = bool(fp_args[1]) if len(fp_args) > 1 else False
+                    stream = len(fp_args) > 2 and bool(fp_args[2])
+                    selection = (
+                        cast("list[str]", fp_args[3]) if len(fp_args) > 3 and isinstance(fp_args[3], list) else None
+                    )
+                    if stream:
+                        # Controller renders natively from the streamed reports → no daemon-side
+                        # progress frames (progress_conn=None), full reports required.
+                        rc, summary = self._run_once(full_report=True, report_conn=conn, selection=selection)
+                    else:
+                        # progress_conn=conn: workers write dots into the DAEMON log, not the
+                        # client's terminal — so we stream progress over this same socket
+                        # (otherwise the client sits silent the whole run and looks frozen).
+                        rc, summary = self._run_once(progress_conn=conn, full_report=full_report)
                     try:
                         _send(conn, {"rc": rc, "summary": summary})
                     except OSError:
@@ -673,7 +738,14 @@ class Daemon:
 
     # ── one run (fork workers + work-stealing dispatch) ──────────────────────
 
-    def _run_once(self, progress_conn: socket.socket | None = None) -> tuple[int, str]:
+    def _run_once(
+        self,
+        progress_conn: socket.socket | None = None,
+        *,
+        full_report: bool = False,
+        report_conn: socket.socket | None = None,
+        selection: list[str] | None = None,
+    ) -> tuple[int, str]:
         idx = self._run_counter
         self._run_counter += 1
         t0 = time.perf_counter()
@@ -686,15 +758,17 @@ class Daemon:
         server.bind(sock_path)
         server.listen(self.num_workers)
 
+        send_nodeids = selection is not None
         procs = [
-            self.ctx.Process(target=_worker_main, args=(wid, sock_path), daemon=True) for wid in range(self.num_workers)
+            self.ctx.Process(target=_worker_main, args=(wid, sock_path, full_report, send_nodeids), daemon=True)
+            for wid in range(self.num_workers)
         ]
         self._arm_collect_flag()  # local-run mode (serve() also calls; repeated invocation is idempotent)
         for p in procs:
             p.start()
 
         try:
-            results, worker_stats, bus, t_ready, total = self._serve_bus(server, progress_conn)
+            results, worker_stats, bus, t_ready, total = self._serve_bus(server, progress_conn, report_conn, selection)
         finally:
             # Bounded join: a healthy worker exits within milliseconds of sending `fin`
             # (it calls `os._exit(0)`). If join exceeds the budget, the worker is wedged
@@ -722,7 +796,14 @@ class Daemon:
 
         label = "BOOT (collect once)" if idx == 0 else f"run #{idx} (warm)"
         summary = self._report(
-            results, worker_stats, bus, total, warmup=t_ready - t0, run=t_done - t_ready, label=label
+            results,
+            worker_stats,
+            bus,
+            total,
+            warmup=t_ready - t0,
+            run=t_done - t_ready,
+            label=label,
+            full_report=full_report,
         )
         rc = 1 if any(r["outcome"] in {"failed", "error"} for r in results) else 0
         # Run integrity: a worker may have died BEFORE sending results (import/assert in
@@ -741,7 +822,11 @@ class Daemon:
         return rc, summary
 
     def _serve_bus(
-        self, server: socket.socket, progress_conn: socket.socket | None = None
+        self,
+        server: socket.socket,
+        progress_conn: socket.socket | None = None,
+        report_conn: socket.socket | None = None,
+        selection: list[str] | None = None,
     ) -> tuple[list[RunResult], list[WorkerStats], dict[str, float], float, int]:
         # Worker connect with timeout: if a forked worker died BEFORE connect (warmup
         # crash), we don't block in accept() forever — start with whoever made it.
@@ -762,6 +847,10 @@ class Daemon:
             expected = len(sel.get_map())
 
             total: int | None = None
+            # When `selection` is set (the --fast plugin forwards the controller's collected
+            # nodeids), pick_list holds the daemon-side item indices to actually run, built from
+            # the first worker 'ready' that carries the nodeid list. None → run the full suite.
+            pick_list: list[int] | None = None
             queue_pos = 0
             results: list[RunResult] = []
             worker_stats: list[WorkerStats] = []
@@ -773,17 +862,35 @@ class Daemon:
 
             def emit_progress(*, force: bool = False) -> None:
                 nonlocal progress_conn, last_emit
-                if progress_conn is None or total is None:
+                tgt = len(pick_list) if pick_list is not None else total  # how many we actually run
+                if progress_conn is None or tgt is None:
                     return
                 now = time.perf_counter()
                 done = len(results)
-                if not force and done < total and now - last_emit < _PROGRESS_THROTTLE_SEC:
-                    return  # throttled to _PROGRESS_THROTTLE_SEC; the final frame (done==total) is always sent
+                if not force and done < tgt and now - last_emit < _PROGRESS_THROTTLE_SEC:
+                    return  # throttled to _PROGRESS_THROTTLE_SEC; the final frame (done==tgt) is always sent
                 last_emit = now
                 try:
-                    _send(progress_conn, {"progress": (done, total)})
+                    _send(progress_conn, {"progress": (done, tgt)})
                 except OSError:
                     progress_conn = None  # client gone (Ctrl-C) — stop sending, but complete the run
+
+            def emit_reports(result: RunResult) -> None:
+                # Stream each phase report ({'report': <serialized>}) to the controller as it
+                # arrives (full-report/plugin mode) so it can republish into a real terminalreporter
+                # live. No-op unless report_conn is set and the result carries full reports.
+                nonlocal report_conn
+                if report_conn is None:
+                    return
+                reps = result.get("reports")
+                if not reps:
+                    return
+                for rep in reps:
+                    try:
+                        _send(report_conn, {"report": rep})
+                    except OSError:
+                        report_conn = None  # controller gone — stop streaming, complete the run
+                        return
 
             while active > 0:
                 for key, _mask in sel.select():
@@ -800,6 +907,13 @@ class Daemon:
                     kind = parts[0]
                     if kind == "ready":
                         total = cast("int", parts[2])
+                        # Selection mode: resolve the controller's nodeids → daemon item indices
+                        # from the first 'ready' that carries the worker's nodeid list. Unknown
+                        # nodeids (not in this daemon's collection) are dropped — the controller's
+                        # collection-match guard reports them.
+                        if selection is not None and pick_list is None and len(parts) > 4 and parts[4] is not None:
+                            idx_of = {nid: i for i, nid in enumerate(cast("list[str]", parts[4]))}
+                            pick_list = [idx_of[n] for n in selection if n in idx_of]
                         ready_seen += 1
                         if ready_seen == expected:
                             t_ready = time.perf_counter()
@@ -808,7 +922,11 @@ class Daemon:
                         if result is not None:
                             results.append(result)
                             emit_progress()
-                        pick = queue_pos if total is not None and queue_pos < total else None
+                            emit_reports(result)
+                        if pick_list is not None:
+                            pick = pick_list[queue_pos] if queue_pos < len(pick_list) else None
+                        else:
+                            pick = queue_pos if total is not None and queue_pos < total else None
                         if pick is not None:
                             queue_pos += 1
                         try:
@@ -826,14 +944,16 @@ class Daemon:
                         result = cast("RunResult | None", parts[2])
                         if result is not None:
                             results.append(result)
+                            emit_reports(result)
                         worker_stats.append(cast("WorkerStats", parts[3]))
                         sel.unregister(conn)
                         conn.close()
                         active -= 1
 
-            emit_progress(force=True)  # final frame (done==total) — guaranteed
+            emit_progress(force=True)  # final frame (done==target) — guaranteed
             bus = {"tx": float(tx), "rx": float(rx), "req_count": float(req_count)}
-            return results, worker_stats, bus, t_ready, total or 0
+            run_total = len(pick_list) if pick_list is not None else (total or 0)
+            return results, worker_stats, bus, t_ready, run_total
         finally:
             sel.close()
 
@@ -846,6 +966,7 @@ class Daemon:
         warmup: float,
         run: float,
         label: str,
+        full_report: bool = False,
     ) -> str:
         from collections import Counter
 
@@ -879,11 +1000,16 @@ class Daemon:
         if xpassed:
             out.append(f"  XPASS ({len(xpassed)}) — stale xfail entries (now pass, drop them):")
             out.extend(f"    ? {r['nodeid']}" for r in xpassed)
-        slow = sorted(results, key=lambda r: r["duration"], reverse=True)
-        slow = [r for r in slow if r["duration"] >= 1.0][:10]
-        if slow:
-            out.append(f"  SLOWEST (≥1s, top {len(slow)}):")
-            out.extend(f"    {r['duration']:7.2f}s  {r['nodeid']}" for r in slow)
+        if full_report:
+            # Full-report mode: a real per-phase --durations table (from serialized reports).
+            out.extend(_durations_lines(results))
+        else:
+            # Lean mode: only whole-test durations are known — show the ≥1s offenders.
+            slow = sorted(results, key=lambda r: r["duration"], reverse=True)
+            slow = [r for r in slow if r["duration"] >= 1.0][:10]
+            if slow:
+                out.append(f"  SLOWEST (≥1s, top {len(slow)}):")
+                out.extend(f"    {r['duration']:7.2f}s  {r['nodeid']}" for r in slow)
         out.append(line)
         return "\n".join(out)
 
@@ -891,10 +1017,14 @@ class Daemon:
 # ── client-side: request a run from the resident daemon ──────────────────────
 
 
-def request_run(address: str) -> dict[str, object]:
+def request_run(address: str, *, full_report: bool = False) -> dict[str, object]:
     """Trigger a run on the daemon; stream progress to stdout, return the final frame
     (`{rc, summary}` or `{stale: True}`). The daemon sends N `{'progress': (done,total)}`
     frames then one final frame — we recv in a loop until a non-progress frame arrives.
+
+    `full_report` asks the daemon to run workers in full-report mode (per-phase reports →
+    a real --durations table in the summary). The flag rides as the 2nd tuple element, so
+    a daemon that predates it simply ignores it and runs lean.
 
     Module-level (not a method of `Daemon`) — this is the **client**, not a server
     method; keeping it on `Daemon` would mix both protocol sides into one class."""
@@ -902,7 +1032,7 @@ def request_run(address: str) -> dict[str, object]:
     with _short_unix_path(address) as connect_path:
         sock.connect(connect_path)
     with sock:
-        _send(sock, ("run", _env_fingerprint()))  # fp → daemon stale-exits on env change
+        _send(sock, ("run", _env_fingerprint(), full_report))  # fp (stale-check) + report mode
         while True:
             raw, _ = _recv(sock)
             if not isinstance(raw, dict):
@@ -914,6 +1044,36 @@ def request_run(address: str) -> dict[str, object]:
                 continue
             print("\r" + " " * 32 + "\r", end="", flush=True)  # erase the progress line
             return frame
+
+
+def request_run_streamed(
+    address: str, on_report: Callable[[dict[str, object]], None], nodeids: list[str] | None = None
+) -> dict[str, object]:
+    """Client for full-report **streaming** (the `pytest --fast` plugin controller). Triggers a
+    run in stream mode, invokes `on_report(serialized_report)` for each per-phase report as it
+    arrives, and returns the final frame (`{rc, summary}` or `{stale: True}`).
+
+    `nodeids` restricts the run to the controller's collected selection (so -k/-m/paths work);
+    None runs the daemon's full suite.
+
+    The controller replays the streamed reports through its own real terminalreporter, so native
+    pytest reporting (--durations / junit / -v/-s / plugins) all work — while the warm forkserver
+    daemon does the actual execution (amortized collect, fork-warm workers)."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    with _short_unix_path(address) as connect_path:
+        sock.connect(connect_path)
+    with sock:
+        _send(sock, ("run", _env_fingerprint(), True, True, nodeids))  # full_report + stream + selection
+        while True:
+            raw, _ = _recv(sock)
+            if not isinstance(raw, dict):
+                return {"rc": 1, "summary": "[pytest-fast] daemon closed connection mid-run"}
+            frame = cast("dict[str, object]", raw)  # daemon frame: report | stale | rc/summary
+            rep = frame.get("report")
+            if rep is not None:
+                on_report(cast("dict[str, object]", rep))
+                continue
+            return frame  # stale | {rc, summary}
 
 
 # ── orchestration: ensure resident daemon + run / stale-restart ──────────────
@@ -1300,24 +1460,37 @@ def _coordinated_spawn(workers: int, start_method: str, address: str, ttl: float
         _spawn_daemon(workers, start_method, address, ttl)
 
 
-def _ensure_and_run(workers: int, start_method: str, address: str, ttl: float, *, with_watcher: bool) -> int:
-    """Connect to the daemon at `address` → run. Spawns the daemon if absent and
-    restarts it if the daemon reports stale code. With `with_watcher` — also
-    guarantees a background watcher (pre-warm on source changes)."""
+def _run_via_daemon(
+    workers: int,
+    start_method: str,
+    address: str,
+    ttl: float,
+    *,
+    with_watcher: bool,
+    run: Callable[[str], dict[str, object]],
+) -> dict[str, object]:
+    """Ensure a resident daemon at `address`, then execute `run(address)` against it —
+    spawning the daemon if absent and respawning it on a `{stale}` reply, bounded by the
+    boot deadline. Returns the final frame from `run` (`{rc, summary}`), or `{rc: 1}` if the
+    daemon never came up / kept reporting stale. Shared by the CLI client (`_ensure_and_run`)
+    and the `--fast` plugin controller (`pytest_runtestloop`).
+
+    Stale is detected by the daemon BEFORE it runs anything (it replies `{stale}` and exits),
+    so a streaming `run` that gets respawned never double-emits reports."""
     if with_watcher:
         _ensure_watcher(workers, start_method, address, ttl)
     deadline = time.monotonic() + _DAEMON_BOOT_TIMEOUT
     spawned = False
     while True:
         try:
-            reply = request_run(address)
+            reply = run(address)
         except (FileNotFoundError, ConnectionRefusedError):
             if not spawned:
                 _coordinated_spawn(workers, start_method, address, ttl)
                 spawned = True
             if time.monotonic() > deadline:
                 print("[pytest-fast] daemon failed to start in time", file=sys.stderr)
-                return 1
+                return {"rc": 1}
             time.sleep(_DAEMON_BACKOFF_AFTER_SPAWN)
             continue
         if reply.get("stale"):
@@ -1329,14 +1502,124 @@ def _ensure_and_run(workers: int, start_method: str, address: str, ttl: float, *
                 # one socket, or a watched file with a future mtime) — give up at the deadline
                 # instead of spinning the client forever.
                 print("[pytest-fast] daemon kept reporting stale past boot deadline", file=sys.stderr)
-                return 1
+                return {"rc": 1}
             time.sleep(_DAEMON_BACKOFF_AFTER_STALE)  # let the old release the socket and the new boot
             continue
-        summary = reply.get("summary")
-        if summary is not None:
-            print(summary)
-        rc = reply.get("rc")
-        return rc if isinstance(rc, int) else 1
+        return reply
+
+
+def _ensure_and_run(
+    workers: int, start_method: str, address: str, ttl: float, *, with_watcher: bool, full_report: bool = False
+) -> int:
+    """CLI client (front A): connect to the daemon → run → print the daemon-rendered summary."""
+    reply = _run_via_daemon(
+        workers,
+        start_method,
+        address,
+        ttl,
+        with_watcher=with_watcher,
+        run=lambda addr: request_run(addr, full_report=full_report),
+    )
+    summary = reply.get("summary")
+    if summary is not None:
+        print(summary)
+    rc = reply.get("rc")
+    return rc if isinstance(rc, int) else 1
+
+
+# ── pytest plugin front-end (`pytest -p pytest_fast --fast`) ─────────────────
+#
+# Run the suite through the resident warm daemon while THIS process stays a real pytest
+# session — so native reporting (terminalreporter, --durations, junit, -v/-s, plugins) all
+# work: we just republish the daemon's streamed per-phase reports through the controller's
+# own `pytest_runtest_logreport` hook (the same mechanism xdist uses). The forkserver daemon
+# does the execution (amortized collect + fork-warm workers), so it stays fast across reruns.
+#
+# The hooks are INERT unless --fast is passed (like xdist with -n), so loading `-p pytest_fast`
+# for the OUTCOME_DUMP reference mode is unaffected.
+
+
+def _default_fast_address() -> str:
+    """Per-project daemon socket when --fast-address isn't given: a short, stable name in
+    TMPDIR derived from the project root (so two checkouts don't share one daemon)."""
+    slug = hashlib.sha1(str(_project_root()).encode()).hexdigest()[:10]
+    return f"{tempfile.gettempdir()}/pytest-fast-{slug}.sock"
+
+
+def pytest_addoption(parser: Parser) -> None:
+    group = parser.getgroup("pytest-fast", "resident forkserver accelerator")
+    group.addoption(
+        "--fast",
+        action="store_true",
+        default=False,
+        help="run the suite via a resident pytest-fast daemon (warm forkserver workers, native reporting)",
+    )
+    group.addoption("--fast-address", default=None, help="daemon unix socket (default: derived from the project root)")
+    group.addoption("--fast-workers", type=int, default=6, help="worker count for --fast (default 6)")
+    group.addoption("--fast-ttl", type=float, default=600.0, help="daemon idle TTL seconds for --fast (default 600)")
+    group.addoption(
+        "--fast-watch",
+        action="store_true",
+        default=False,
+        help="also keep a background watcher pre-warming the daemon on source changes",
+    )
+
+
+def pytest_runtestloop(session: Session) -> bool | None:
+    """When --fast: hand execution to the resident daemon and republish its streamed reports
+    through this controller's hooks (native reporting). Returns True (loop handled). Inert
+    (returns None → pytest's normal in-process loop) otherwise."""
+    config = session.config
+    if not config.getoption("fast", default=False):
+        return None
+    if session.testsfailed and not config.getvalue("continue_on_collection_errors"):
+        raise session.Interrupted(f"{session.testsfailed} error(s) during collection")
+
+    address = config.getoption("fast_address") or _default_fast_address()
+    workers = cast("int", config.getoption("fast_workers"))  # default=6 → never None
+    ttl = cast("float", config.getoption("fast_ttl"))  # default=600.0 → never None
+    with_watcher = bool(config.getoption("fast_watch"))
+
+    collected = [item.nodeid for item in session.items]
+    collected_set = set(collected)
+    seen: set[str] = set()
+
+    def on_report(data: dict[str, object]) -> None:
+        rep = config.hook.pytest_report_from_serializable(config=config, data=data)
+        seen.add(rep.nodeid)
+        # Republish into the controller's real terminalreporter / plugins / pass-fail accounting.
+        config.hook.pytest_runtest_logreport(report=rep)
+
+    # Forward THIS session's collected nodeids → the daemon runs exactly that selection (so
+    # -k/-m/explicit paths work; the full suite is just "all nodeids").
+    reply = _run_via_daemon(
+        workers,
+        "forkserver",
+        address,
+        ttl,
+        with_watcher=with_watcher,
+        run=lambda addr: request_run_streamed(addr, on_report, collected),
+    )
+
+    # Collection-match guard: every selected test must have been run by the daemon. A `missing`
+    # nodeid means the daemon's collection lacks it (drifted/stale despite the fingerprint check)
+    # — fail loudly rather than silently under-report.
+    missing = collected_set - seen
+    if missing:
+        import pytest
+
+        raise pytest.UsageError(
+            f"--fast: {len(missing)} selected test(s) were not run by the daemon "
+            f"(e.g. {sorted(missing)[:3]}) — its collection may differ from this session. "
+            "Try again (the daemon will respawn on a source/env change), or run without --fast."
+        )
+
+    rc = reply.get("rc")
+    if rc not in (0, None) and not session.testsfailed:
+        # Daemon flagged the run untrusted (worker crash / result undercount) but no republished
+        # report marked a failure — surface it so a green exit can't hide a broken run.
+        session.shouldfail = "pytest-fast: daemon reported an untrusted run (see daemon log)"
+    return True
 
 
 # ── source watcher (--watch): pre-warm staging successor, then promote ────────
@@ -1529,6 +1812,11 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--runs", type=int, default=1, help="local single-process mode: number of in-process runs")
     parser.add_argument("--dump", help="local mode: write {nodeid: outcome} JSON (for the outcome-diff harness)")
+    parser.add_argument(
+        "--full-report",
+        action="store_true",
+        help="ship full per-phase reports → a real --durations table in the summary (heavier bus)",
+    )
     ns = parser.parse_args(argv)
     if ns.workers < 1:
         parser.error("--workers must be >= 1")
@@ -1542,8 +1830,17 @@ def main(argv: list[str]) -> int:
             parser.error("--serve requires --address")
         return Daemon(num_workers=ns.workers, start_method=ns.start_method).serve(ns.address, ns.ttl)
     if ns.address:
-        return _ensure_and_run(ns.workers, ns.start_method, ns.address, ns.ttl, with_watcher=ns.with_watcher)
-    return Daemon(num_workers=ns.workers, start_method=ns.start_method, dump_path=ns.dump).run(ns.runs)
+        return _ensure_and_run(
+            ns.workers,
+            ns.start_method,
+            ns.address,
+            ns.ttl,
+            with_watcher=ns.with_watcher,
+            full_report=ns.full_report,
+        )
+    return Daemon(num_workers=ns.workers, start_method=ns.start_method, dump_path=ns.dump).run(
+        ns.runs, full_report=ns.full_report
+    )
 
 
 def main_cli() -> int:

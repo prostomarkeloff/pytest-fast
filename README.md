@@ -13,17 +13,20 @@
 
 A resident `forkserver`-based pytest accelerator. The first run boots a daemon that imports your app graph and collects tests **once**. Every subsequent run forks warm workers — collect-free, import-free, ready in milliseconds. Edit a file? The daemon notices and re-collects automatically.
 
-Drop-in alternative to `pytest-xdist` for the common case (`-n N` parallel workers). Same set of tests, same `marks`/`skip`/`xfail`/`reruns` behavior — they run through the **full** pytest protocol (`pytest_runtest_protocol`), not a custom executor.
+Two ways to drive it, one warm engine underneath:
+
+- **`pytest --fast`** — a pytest plugin. Your `pytest` invocation stays a real pytest session, so reporting is **100% native** (terminal, `--durations`, `-v/-s`, `--junitxml`, plugins, exit codes) — the warm daemon just does the execution.
+- **`pytest-fast --address …`** — a standalone CLI. A thin client triggers the daemon and prints a lean, bespoke summary. Lowest overhead; great for tight TDD loops and CI.
 
 ```bash
 uv add git+https://github.com/prostomarkeloff/pytest-fast.git
 ```
 
 ```bash
-pytest-fast --address /tmp/myproj.sock --workers 6
-#                                                ^ first run: boot (~3s) + run
-#                                                  subsequent runs: just fork()+run
+pytest --fast                 # native pytest output, warm forkserver execution
 ```
+
+> **POSIX only** (uses `forkserver` / `AF_UNIX` / `fcntl`). On Windows, use `pytest-xdist`.
 
 ---
 
@@ -45,29 +48,77 @@ total wall, N=6        ~30s + tests              ~0.3s + tests
 
 The daemon stays alive for `--ttl` seconds of idle. Edit a source file → next run sees the change, the daemon re-collects and forks fresh workers transparently. Change a relevant env var → same. No manual restart, no `kill`-ing PIDs.
 
+The speed win lives entirely in **collection amortization** — it's independent of how results are reported. That's why `pytest --fast` can give you *both* warm execution *and* full native reporting.
+
 ---
 
-## What you actually run
+## `pytest --fast` — the plugin (native reporting)
+
+Auto-registered via pytest's `pytest11` entry point, so it works out of the box — no `-p` needed. It's **inert unless you pass `--fast`** (exactly like `xdist` is inert without `-n`), so a plain `pytest` run is completely unaffected.
+
+```bash
+pytest --fast                          # whole suite, native output, via the warm daemon
+pytest --fast -k payment               # selection is forwarded to the daemon
+pytest --fast -v --durations=10        # native verbose + native slowest-durations
+pytest --fast --junitxml=out.xml       # native junit — the controller IS pytest
+```
+
+```text
+============================= test session starts ==============================
+collected 413 items
+............................................F............................ [ 17%]
+...
+=================================== FAILURES ===================================
+____________________________ test_invalid_token ________________________________
+    def test_invalid_token():
+>       assert client.post("/login").status_code == 401
+E       assert 200 == 401
+tests/api/test_auth.py:42: AssertionError
+============================= slowest 10 durations ==============================
+2.13s call     tests/integration/test_payment_flow.py::test_full_purchase
+0.92s setup    tests/db/test_migrations.py::test_full_upgrade
+...
+=========================== short test summary info ============================
+FAILED tests/api/test_auth.py::test_invalid_token - assert 200 == 401
+======================== 1 failed, 412 passed in 8.4s ==========================
+```
+
+That's **real pytest output**, not a re-implementation. How: your `pytest` process stays the controller (a real pytest session with a real `terminalreporter`); `pytest_runtestloop` hands execution to the resident daemon; the daemon runs your tests in warm fork workers and **streams full per-phase reports** back; the controller republishes each through its own `pytest_runtest_logreport` hook — the same mechanism xdist uses. So everything subscribed to that hook (terminal, durations, junit, html, coverage-ish, custom plugins, exit-code accounting) just works.
+
+| option | default | meaning |
+|---|---|---|
+| `--fast` | off | run via the resident daemon (otherwise pytest runs normally) |
+| `--fast-address PATH` | derived from project root | daemon Unix socket |
+| `--fast-workers N` | 6 | worker count |
+| `--fast-ttl SECONDS` | 600 | daemon idle TTL |
+| `--fast-watch` | off | also keep a pre-warm watcher running (see below) |
+
+**Selection** (`-k`, `-m`) is forwarded — the daemon runs exactly the tests your session collected. **Caveat:** explicit path/nodeid args (`pytest --fast tests/x.py::test_y`) can produce rootdir-relative nodeids that don't line up with the daemon's collection (an xdist-class issue); when that happens the run fails loudly with a clear message rather than silently mis-reporting. Use `-k`/`-m` or a full run.
+
+---
+
+## `pytest-fast` — the CLI runner (lean & fast)
+
+A standalone client/daemon. The client is trivial; the daemon renders a compact, bespoke summary. This is the lowest-overhead path — no controller-side collection, the thinnest possible bus.
 
 ```bash
 # One-shot: connect to (or spawn) a resident daemon, run all tests, print summary
 pytest-fast --address /tmp/myproj.sock --workers 6
 
-# Same again — the daemon is already warm
+# Same again — the daemon is already warm → just fork + run, no collect
 pytest-fast --address /tmp/myproj.sock --workers 6
-#   → warm fork + run, no collect
+
+# Per-phase --durations in the summary (ships full reports on the bus)
+pytest-fast --address /tmp/myproj.sock --workers 6 --full-report
+
+# Pre-warm: a watcher refreshes the daemon BEFORE you re-run (see Watcher)
+pytest-fast --address /tmp/myproj.sock --workers 6 --with-watcher
 
 # Local single-process mode (no resident daemon, useful for CI smoke)
 pytest-fast --runs 1 --workers 4
-
-# Pre-warm: a background watcher polls source mtimes and refreshes the daemon
-# BEFORE you re-run, so even after an edit the next run is still warm
-pytest-fast --address /tmp/myproj.sock --workers 6 --with-watcher
 ```
 
-Output:
-
-```
+```text
 ══════════════════════════════════════════════════════════════════
   FORKSERVER DAEMON  —  6w  —  run #3 (warm)
 ══════════════════════════════════════════════════════════════════
@@ -78,18 +129,19 @@ Output:
   bus     : 467 round-trips, 24KB rx
   FAILURES (1):
     ✗ tests/api/test_auth.py::test_invalid_token
-      def test_invalid_token():
       >       assert client.post("/login").status_code == 401
       E       assert 200 == 401
       tests/api/test_auth.py:42: AssertionError
-  SLOWEST (≥1s, top 3):
-       2.13s  tests/integration/test_payment_flow.py::test_full_purchase
-       1.84s  tests/db/test_migrations.py::test_full_upgrade
-       1.21s  tests/api/test_search.py::test_complex_filter
+  DURATIONS (top 3, ≥5ms — per phase):     # only with --full-report
+     2.130s  call     tests/integration/test_payment_flow.py::test_full_purchase
+     0.920s  setup    tests/db/test_migrations.py::test_full_upgrade
+     1.210s  call     tests/api/test_search.py::test_complex_filter
 ══════════════════════════════════════════════════════════════════
 ```
 
 `par. 5.21x of 6` is the actual parallelism — total worker-busy time divided by wall. The closer to N, the better the work-stealing dispatcher kept your workers busy.
+
+The CLI summary is **lossy by design** (counts, failure tracebacks, durations) — it's a bespoke render, not pytest's. Want full native reporting? Use `pytest --fast`. Want the absolute thinnest, fastest loop? Stay here.
 
 ---
 
@@ -99,11 +151,10 @@ Output:
 
 ```
                      ┌──────────────────────────────────────┐
-client ──────────►   │  DAEMON (main process)               │
-make test-full       │  - forkserver context                │
+client / pytest ─►   │  DAEMON (main process)               │
+  --fast             │  - forkserver context                │
                      │  - control socket (run/status/...)   │
                      └──────────────────────────────────────┘
-                                  │
                                   │ first Process.start()
                                   ▼
                      ┌──────────────────────────────────────┐
@@ -113,182 +164,133 @@ make test-full       │  - forkserver context                │
                      │  - holds: items[], config            │
                      └──────────────────────────────────────┘
                                   │ fork() per worker per run
-                                  ▼
-       ┌──────────────┬──────────────┬──────────────┐
+       ┌──────────────┬──────────┴───┬──────────────┐
        ▼              ▼              ▼              ▼
   WORKER 0       WORKER 1       WORKER 2       WORKER 3
-  inherits       inherits       inherits       inherits
-  items+config   items+config   items+config   items+config
-  ↓              ↓              ↓              ↓
-  pulls test idx from master via Unix socket (work-stealing)
-  runs pytest_runtest_protocol(item, nextitem)
-  ships RunResult back
+  inherit items+config (copy-on-write), pull a test index from the
+  master over a Unix socket (work-stealing), run pytest_runtest_protocol,
+  ship the result back — lean RunResult, or full serialized reports.
 ```
 
-The `forkserver` is Python's stdlib `multiprocessing` start method that holds a single clean, preloaded process and forks workers out of it on demand. We set `set_forkserver_preload(["pytest_fast"])`, which imports our package — and at the bottom of `__init__.py`, that import triggers `_collect()`. The forkserver process now holds the collected items in its heap.
+`forkserver` is Python's stdlib `multiprocessing` start method that holds one clean, preloaded process and forks workers from it on demand. We set `set_forkserver_preload(["pytest_fast"])`; importing the package triggers `_collect()` at the bottom of `__init__.py`, so the forkserver process holds the collected items in its heap. Each worker is a `fork()` — **copy-on-write**, so items/config aren't re-allocated. `gc.freeze()` after collect moves everything to the permanent generation so GC doesn't dirty the COW pages.
 
-Each worker is a `fork()` out of the forkserver — **copy-on-write**, so the test items and config aren't re-allocated, just referenced. `gc.freeze()` after collect moves everything into the permanent generation so GC doesn't dirty the COW pages.
+### Two front-ends, one engine
+
+The warm forkserver + work-stealing bus is shared. The only difference is **who renders the report**:
+
+- **CLI runner** — the daemon itself renders the bespoke summary and the thin client prints it. Lowest overhead.
+- **`--fast` plugin** — the daemon streams full, serialized per-phase reports; the pytest controller republishes them into its own real `terminalreporter`. Because the daemon is resident, the controller's config/reporter cost is paid once and amortized — so you get native reporting *and* warmth, which a per-run cold controller (xdist) cannot.
+
+Full reports cross the bus as plain-builtins dicts (`pytest_report_to_serializable`), so the pickle whitelist (below) is unchanged. The bus is heavier in full-report mode (~6× per test — longrepr + captured sections) but it's a local Unix socket, negligible against test time. `_MAX_FRAME_BYTES` is 256 MB.
 
 ### Stale detection — two axes
 
 A warm daemon is wrong if:
 
-1. **Source files changed** — `max(mtime)` of dirs in `PYTEST_FAST_WATCH_DIRS` (default `src,tests`) plus files in `PYTEST_FAST_WATCH_FILES` (default `pyproject.toml,pytest.ini`) is compared against the snapshot taken at boot. Both env vars use PATH-style REPLACE semantics — set them to whatever your project needs (flat layouts, `setup.cfg`, `tox.ini`, etc.). Implemented via early-exit `_any_source_newer(threshold)` so on large repos a single newer file short-circuits the scan.
-
+1. **Source files changed** — `max(mtime)` of dirs in `PYTEST_FAST_WATCH_DIRS` (default `src,tests`) plus files in `PYTEST_FAST_WATCH_FILES` (default `pyproject.toml,pytest.ini`), compared against the snapshot taken at boot. Both use PATH-style REPLACE semantics. Implemented via early-exit `_any_source_newer(threshold)` so on large repos a single newer file short-circuits the scan.
 2. **Relevant env changed** — `PYTEST_ADDOPTS`, `PYTEST_FAST_*`, and any prefix you list in `PYTEST_FAST_ENV_PREFIXES` (e.g. `MYAPP_,FEATURE_`) are hashed into an env fingerprint. The client sends its current fp on every request; the daemon compares against its boot fp.
 
-On mismatch, the daemon replies `{stale: True}` and exits. The client (`_ensure_and_run`) catches that, coordinates a respawn under a `flock`, and reconnects — invisible to the user except for one "restarting daemon" line in stderr.
+On mismatch, the daemon replies `{stale: True}` and exits. The client coordinates a respawn under a `flock` and reconnects — invisible except for one "restarting daemon" line in stderr. The respawn loop is deadline-bounded, so a perpetually-stale condition can't livelock the client.
 
-### Watcher (`--with-watcher`)
+### Watcher (`--with-watcher` / `--fast-watch`)
 
-Optional, opt-in. A background poll loop watches the same source set and, on a debounced change, spawns a successor daemon on a `*.staging` socket. Once the successor is ready (collect succeeded), it cleanly shuts down the old one and rebinds onto the canonical address. **The next user `run` finds a warm-and-fresh daemon instead of paying the boot cost on the critical path.**
-
-If the staging successor fails (broken edit, conftest error), the old daemon stays untouched.
+Optional, opt-in. A background poll loop watches the same source set and, on a debounced change, boots a successor daemon on a `*.staging` socket. Once the successor is ready (collect succeeded), it cleanly shuts down the old one and rebinds onto the canonical address. **The next run finds a warm-and-fresh daemon instead of paying the boot cost on the critical path.** A broken edit (conftest error) leaves the current daemon untouched.
 
 ### Control protocol
 
-One length-prefixed pickle message per connection, serialized through the daemon's `accept()` loop — so an active test run is **never** interrupted by a control command. Four commands:
+One length-prefixed pickle message per connection, serialized through the daemon's `accept()` loop — so an active run is **never** interrupted by a control command:
 
 ```python
-('run',      fingerprint)  → stream {progress} frames + final {rc, summary} (or {stale})
-('status',   fingerprint)  → {ready: True, stale: bool}     # cheap probe
-('shutdown',)              → {bye: True}; exit              # used by watcher-promote
-('promote',  new_address)  → rebind onto a new address      # staging → canonical
+('run', fp[, full_report[, stream[, nodeids]]])
+        → {progress}/{report} frames + final {rc, summary}  (or {stale})
+('status',   fp)            → {ready: True, stale: bool}     # cheap probe
+('shutdown',)               → {bye: True}; exit              # watcher-promote
+('promote',  new_address)   → rebind onto a new address      # staging → canonical
 ```
 
-Pickle, but locked down: a `_SafeUnpickler` whitelists `builtins.*` only. Our wire protocol carries `tuple`/`dict`/`str`/`int`/`bool`/`None`/`bytes` — nothing else. A malicious local pickle into the socket can't escalate to code execution.
+`full_report` ships per-phase reports; `stream` makes the daemon stream them live (the `--fast` controller); `nodeids` restricts the run to a forwarded selection.
+
+Pickle, but locked down: a `_SafeUnpickler` whitelists `builtins.*` only. Every frame — control messages *and* serialized reports — is `tuple`/`dict`/`list`/`str`/`int`/`float`/`bool`/`None`/`bytes`. A malicious local pickle into the socket can't escalate to code execution. Malformed frames (empty/short tuples, garbage, oversized headers) are tolerated, never fatal.
 
 ---
 
-## Drop-in vs xdist
+## vs `pytest-xdist`
 
 | | `pytest-xdist -n N` | `pytest-fast` |
 |---|---|---|
 | Workers | N | N |
-| App import on first run | N × full import | 1 × full import |
-| App import on subsequent runs | N × full import | 0 (warm daemon) |
-| Collect on first run | N × collect | 1 × collect |
-| Collect on subsequent runs | N × collect | 0 (cached) |
-| Source change → respawn | manual | automatic |
-| Env change → respawn | manual | automatic (via fingerprint) |
+| App import, first run | N × full import | 1 × full import |
+| App import, later runs | N × full import | **0** (warm daemon) |
+| Collect, first run | N × collect | 1 × collect |
+| Collect, later runs | N × collect | **0** (cached) |
+| Source change → respawn | manual | **automatic** |
+| Env change → respawn | manual | **automatic** (fingerprint) |
 | `pytest_runtest_protocol` | yes | yes |
 | Marks / skip / xfail / reruns | yes | yes |
-| `pytest.ini` / `pyproject.toml` config | yes | yes |
-| Custom report plugins (junit, html) | yes | **lossy** (text summary only) |
-| Cross-platform | win + posix | **POSIX only** (uses forkserver/AF_UNIX/fcntl) |
+| `pytest.ini` / `pyproject.toml` | yes | yes |
+| Native reporting (junit / html / `--durations` / `-v`) | yes | **yes** via `pytest --fast`; lossy in the CLI runner |
+| Test selection (`-k`/`-m`) | yes | yes (`--fast`); full-suite in the CLI runner |
+| Remote / multi-host | yes (`--tx ssh=…`) | no (single host) |
+| Cross-platform | win + posix | **POSIX only** |
 
-If you need junit XML, allure, html reports, or you run on Windows — stay on xdist. If you spend 30 seconds re-importing your app graph every time you re-run a 5-second test suite — `pytest-fast` is for you.
+If you need Windows or remote fan-out across machines — use xdist. If you spend 30 seconds re-importing your app graph every time you re-run a 5-second suite — `pytest-fast` is for you, and `pytest --fast` gives you xdist-grade reporting on top of it.
+
+`pytest-xdist` lives in the optional `xdist-parity` dependency group (used only to cross-check behavior): `uv sync --group xdist-parity`.
 
 ---
 
-## Environment variables
+## Configuration
 
-`pytest-fast` is configured entirely via env vars — no config file. Everything
-relevant is in the table below; the rest of this section walks through what each
-knob does and a few common project layouts.
-
-### Reference
+`pytest-fast` is configured entirely via env vars — no config file.
 
 | Variable | Default | Semantics | What it does |
 |---|---|---|---|
-| `PYTEST_FAST_ROOT` | `os.getcwd()` | absolute or relative path | Project root for the mtime scan. Override when launching pytest-fast outside the repo root, or for isolated test runs. |
-| `PYTEST_FAST_WATCH_DIRS` | `src,tests` | comma/colon, **REPLACE** | Dirs scanned recursively for `*.py` mtime. Env REPLACES the default — flat-layout projects set `mypkg,tests`. Empty value scans no dirs. |
-| `PYTEST_FAST_WATCH_FILES` | `pyproject.toml,pytest.ini` | comma/colon, **REPLACE** | Standalone config files included in the mtime scan. REPLACES the default — add `setup.cfg`, `tox.ini`, root `conftest.py`, etc. as your project needs. |
-| `PYTEST_FAST_MARK` | `""` (no filter) | string | Pytest marker expression. Passed as `-m` during collection (`pytest_fast -m "not slow"` equivalent). |
-| `PYTEST_ADDOPTS` | (inherited) | pytest opts | Standard pytest addopts. Included in the env fingerprint so a change forces respawn. |
-| `PYTEST_FAST_ENV_PREFIXES` | `""` | comma-separated | Env-var prefixes whose change must force respawn. Use this to mark your app config — `MYAPP_,FEATURE_` covers `MYAPP_DB_HOST=...` and `FEATURE_X=...` shifts. |
-| `OUTCOME_DUMP` | `""` | path | When set, the `-p pytest_fast` plugin mode writes `{nodeid: outcome}` JSON on `pytest_sessionfinish` — useful as a reference dump for outcome-diff against xdist. |
+| `PYTEST_FAST_ROOT` | `os.getcwd()` | path | Project root for the mtime scan. Override when launching outside the repo root. |
+| `PYTEST_FAST_WATCH_DIRS` | `src,tests` | comma/colon, **REPLACE** | Dirs scanned recursively for `*.py` mtime. Flat layouts: `mypkg,tests`. Empty value scans no dirs. |
+| `PYTEST_FAST_WATCH_FILES` | `pyproject.toml,pytest.ini` | comma/colon, **REPLACE** | Standalone config files in the mtime scan — add `setup.cfg`, `tox.ini`, root `conftest.py`, etc. |
+| `PYTEST_FAST_MARK` | `""` | string | Marker expression, passed as `-m` during collection. |
+| `PYTEST_ADDOPTS` | (inherited) | pytest opts | Standard pytest addopts. In the env fingerprint → a change forces respawn. |
+| `PYTEST_FAST_ENV_PREFIXES` | `""` | comma-separated | Env-var prefixes whose change forces respawn. Mark your app config: `MYAPP_,FEATURE_`. |
+| `OUTCOME_DUMP` | `""` | path | With `pytest -p pytest_fast`, writes `{nodeid: outcome}` JSON on sessionfinish — a reference dump for outcome-diff against xdist. |
 
-All variables listed are in the env fingerprint. A change to any of them forces
-the daemon to exit and the client to spawn a fresh one (with the new env baked
-in). You never need to manually kill a daemon.
-
-### Watch-set: what triggers re-collect
-
-The two `WATCH_*` vars together define **"a change to any of these files invalidates
-the warm daemon"**. PATH-style REPLACE semantics: set them and they completely
-override the defaults, not append.
+All listed variables are in the env fingerprint; changing any forces a fresh daemon (you never need to manually kill one).
 
 ```bash
-# Flat layout — package directly under repo root
-PYTEST_FAST_WATCH_DIRS=mypkg,tests
-
-# Mono-repo with multiple packages
-PYTEST_FAST_WATCH_DIRS=services/api/src,services/worker/src,tests
-
-# Tox-using project — extra config files
-PYTEST_FAST_WATCH_FILES=pyproject.toml,pytest.ini,tox.ini,setup.cfg
-
-# Conftest-heavy project — also re-collect when root conftest changes
-PYTEST_FAST_WATCH_FILES=pyproject.toml,pytest.ini,conftest.py
-
-# Scan nothing (advanced; daemon will never go stale on source — useful when
-# the only thing that should drive respawn is PYTEST_FAST_ENV_PREFIXES)
-PYTEST_FAST_WATCH_DIRS=
-PYTEST_FAST_WATCH_FILES=
-```
-
-### App-config invalidation: `PYTEST_FAST_ENV_PREFIXES`
-
-The daemon caches your app-graph **as imported at boot**. If your app reads
-`MYAPP_DB_HOST` at import time and you flip it, the warm daemon would run tests
-against the old config. `PYTEST_FAST_ENV_PREFIXES` tells pytest-fast which env
-prefixes should drive a respawn:
-
-```bash
-# Single app prefix
-PYTEST_FAST_ENV_PREFIXES=MYAPP_
-
-# Multiple prefixes
-PYTEST_FAST_ENV_PREFIXES=MYAPP_,FEATURE_,DATABASE_
-
-# Now any of these flips forces respawn:
-MYAPP_DB_HOST=prod   pytest-fast --address /tmp/s.sock   # boots daemon A
-MYAPP_DB_HOST=stage  pytest-fast --address /tmp/s.sock   # → fp mismatch → daemon A exits, daemon B boots
-```
-
-Without `PYTEST_FAST_ENV_PREFIXES`, only the keys in the explicit whitelist
-(`PYTEST_ADDOPTS`, `PYTEST_FAST_*`, `OUTCOME_DUMP`, `PYTEST_FAST_MARK`) drive
-staleness — random shell vars don't.
-
-### Putting it together
-
-A FastAPI project with `app/` and `tests/` layout, SQLAlchemy + Pydantic, using `tox.ini`:
-
-```bash
+# A FastAPI project: app/ + tests/ layout, SQLAlchemy + Pydantic, tox.ini
 export PYTEST_FAST_WATCH_DIRS=app,tests
 export PYTEST_FAST_WATCH_FILES=pyproject.toml,pytest.ini,tox.ini
 export PYTEST_FAST_ENV_PREFIXES=APP_,DB_
 
-# Now any of these triggers respawn automatically:
+# Now any of these triggers an automatic respawn:
 #   - edit app/**/*.py or tests/**/*.py
 #   - edit pyproject.toml / pytest.ini / tox.ini
 #   - flip APP_DEBUG or DB_HOST
-pytest-fast --address /tmp/myapp.sock --workers 6
+pytest --fast                # or: pytest-fast --address /tmp/myapp.sock --workers 6
 ```
 
-### CLI flags
+### CLI flags (`pytest-fast`)
 
 ```
 --address PATH       Unix socket of the resident daemon (caller picks the path)
 --ttl SECONDS        Idle seconds before daemon self-shutdown (default 600)
---workers N          Parallel worker count (default 6)
+--workers N          Parallel worker count (default 6, must be >= 1)
 --start-method M     spawn / forkserver / fork (default forkserver)
---serve              Be the resident daemon (internal — clients trigger this)
---watch              Be the source watcher (internal — `--with-watcher` triggers this)
+--full-report        Ship full per-phase reports → a real --durations table in the summary
 --with-watcher       Spawn a pre-warm watcher alongside the daemon
 --runs N             Local single-process mode (no daemon)
 --dump PATH          Local mode: write {nodeid: outcome} JSON
+--serve / --watch    Internal (the daemon / watcher processes spawn themselves with these)
 ```
 
 ---
 
 ## Limitations
 
-- **POSIX only.** `fcntl`, `AF_UNIX`, `multiprocessing.forkserver` are required. The package imports `fcntl` at the top — Windows fails on import. The Windows CI matrix is `continue-on-error` until someone ports the watcher/flock/socket bits.
-- **Reports are lossy.** Failure tracebacks, captured stdout/stderr/log, slowest tests, and outcome counts are preserved. Full `TestReport` objects don't survive the pickle wire — so xdist-style `--junitxml`/`--html` plugins won't see what they expect. The reference `OUTCOME_DUMP` plugin mode exists for outcome-diff with xdist.
-- **macOS fork safety.** Code that resolves hostnames via `getaddrinfo("localhost")` inside a fork will segfault (mDNS/CoreFoundation init). Pre-resolve to numeric IPs in your config. pytest-fast doesn't auto-rewrite.
-- **Single host.** No remote workers. If you need fan-out across machines, use xdist + ssh.
+- **POSIX only.** `fcntl`, `AF_UNIX`, `multiprocessing.forkserver` are required; the package imports `fcntl` at the top, so Windows fails on import. Use xdist on Windows.
+- **CLI-runner reports are lossy.** The `pytest-fast --address` summary is a bespoke render (counts, tracebacks, durations). For full `--junitxml`/`--html`/plugin-grade reporting, use **`pytest --fast`**, which is natively pytest.
+- **`--fast` selection caveat.** `-k`/`-m` and full runs are forwarded to the daemon; explicit path/nodeid args can mismatch on rootdir-derived nodeids and are rejected with a clear error (run them without `--fast`).
+- **macOS fork safety.** Code resolving hostnames via `getaddrinfo("localhost")` inside a fork can segfault (mDNS/CoreFoundation). Pre-resolve to numeric IPs in your config; pytest-fast doesn't auto-rewrite.
+- **Single host.** No remote workers. For fan-out across machines, use xdist + ssh.
 
 ---
 
@@ -299,14 +301,11 @@ git clone https://github.com/prostomarkeloff/pytest-fast
 cd pytest-fast
 uv sync
 
-# Lint (ruff format + ruff check --fix + pyright)
-make lint-heavy
-
-# Run pytest-fast's own tests through pytest-fast (dogfood)
-make test-full
+make lint-heavy     # ruff format + ruff check --fix + pyright
+make test-full      # run pytest-fast's own tests through pytest-fast (dogfood)
 ```
 
-The test suite is **40 tests** covering the bus protocol, env fingerprint, watch-root parsing, daemon lifecycle (spawn / status / run / shutdown / idle-ttl), watcher (flock single-instance / promote on source change / no-promote on broken collect), and CLI smoke. CI runs the lint + a `os: [ubuntu, macos, windows] × python: [3.11, 3.12, 3.13, 3.14]` matrix.
+The suite covers the bus protocol & malformed-frame robustness, env fingerprint & watch-root parsing, daemon lifecycle (spawn / status / run / shutdown / idle-ttl), the watcher (flock single-instance / promote / no-promote on broken collect), full-report wire format, the `pytest --fast` plugin (native output, selection forwarding, inert-without-`--fast`), and CLI smoke. CI runs lint plus an `os: [ubuntu, macos, windows] × python: [3.11–3.14]` matrix (tests are skipped on Windows — POSIX only).
 
 ---
 
