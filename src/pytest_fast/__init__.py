@@ -62,10 +62,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from multiprocessing.context import DefaultContext
 
     from _pytest.config import Config
+    from _pytest.config.argparsing import Parser
+    from _pytest.main import Session
     from _pytest.nodes import Item
     from _pytest.reports import TestReport
 
@@ -81,6 +83,7 @@ __all__ = [
     "main",
     "main_cli",
     "request_run",  # client-side, module-level
+    "request_run_streamed",  # client-side streaming (used by the --fast plugin controller)
 ]
 
 
@@ -693,12 +696,20 @@ class Daemon:
                         _log("daemon", f"{reason} — exiting stale")
                         _send(conn, {"stale": True})
                         return 0  # finally releases the socket → client spawns a fresh daemon
-                    # Optional 2nd arg = full-report mode (old clients send only fp → lean).
+                    # Optional args: ('run', fp, full_report[, stream]). Old clients send only
+                    # fp → lean. `stream` (the plugin controller) asks the daemon to stream the
+                    # serialized per-phase reports back over this socket for native republishing.
                     full_report = bool(fp_args[1]) if len(fp_args) > 1 else False
-                    # progress_conn=conn: workers write dots into the DAEMON log, not the client's
-                    # terminal — so we stream progress over this same socket (otherwise the client
-                    # sits silent the whole run and looks frozen).
-                    rc, summary = self._run_once(progress_conn=conn, full_report=full_report)
+                    stream = len(fp_args) > 2 and bool(fp_args[2])
+                    if stream:
+                        # Controller renders natively from the streamed reports → no daemon-side
+                        # progress frames (progress_conn=None), full reports required.
+                        rc, summary = self._run_once(full_report=True, report_conn=conn)
+                    else:
+                        # progress_conn=conn: workers write dots into the DAEMON log, not the
+                        # client's terminal — so we stream progress over this same socket
+                        # (otherwise the client sits silent the whole run and looks frozen).
+                        rc, summary = self._run_once(progress_conn=conn, full_report=full_report)
                     try:
                         _send(conn, {"rc": rc, "summary": summary})
                     except OSError:
@@ -712,7 +723,13 @@ class Daemon:
 
     # ── one run (fork workers + work-stealing dispatch) ──────────────────────
 
-    def _run_once(self, progress_conn: socket.socket | None = None, *, full_report: bool = False) -> tuple[int, str]:
+    def _run_once(
+        self,
+        progress_conn: socket.socket | None = None,
+        *,
+        full_report: bool = False,
+        report_conn: socket.socket | None = None,
+    ) -> tuple[int, str]:
         idx = self._run_counter
         self._run_counter += 1
         t0 = time.perf_counter()
@@ -734,7 +751,7 @@ class Daemon:
             p.start()
 
         try:
-            results, worker_stats, bus, t_ready, total = self._serve_bus(server, progress_conn)
+            results, worker_stats, bus, t_ready, total = self._serve_bus(server, progress_conn, report_conn)
         finally:
             # Bounded join: a healthy worker exits within milliseconds of sending `fin`
             # (it calls `os._exit(0)`). If join exceeds the budget, the worker is wedged
@@ -788,7 +805,10 @@ class Daemon:
         return rc, summary
 
     def _serve_bus(
-        self, server: socket.socket, progress_conn: socket.socket | None = None
+        self,
+        server: socket.socket,
+        progress_conn: socket.socket | None = None,
+        report_conn: socket.socket | None = None,
     ) -> tuple[list[RunResult], list[WorkerStats], dict[str, float], float, int]:
         # Worker connect with timeout: if a forked worker died BEFORE connect (warmup
         # crash), we don't block in accept() forever — start with whoever made it.
@@ -832,6 +852,23 @@ class Daemon:
                 except OSError:
                     progress_conn = None  # client gone (Ctrl-C) — stop sending, but complete the run
 
+            def emit_reports(result: RunResult) -> None:
+                # Stream each phase report ({'report': <serialized>}) to the controller as it
+                # arrives (full-report/plugin mode) so it can republish into a real terminalreporter
+                # live. No-op unless report_conn is set and the result carries full reports.
+                nonlocal report_conn
+                if report_conn is None:
+                    return
+                reps = result.get("reports")
+                if not reps:
+                    return
+                for rep in reps:
+                    try:
+                        _send(report_conn, {"report": rep})
+                    except OSError:
+                        report_conn = None  # controller gone — stop streaming, complete the run
+                        return
+
             while active > 0:
                 for key, _mask in sel.select():
                     conn = key.fileobj
@@ -855,6 +892,7 @@ class Daemon:
                         if result is not None:
                             results.append(result)
                             emit_progress()
+                            emit_reports(result)
                         pick = queue_pos if total is not None and queue_pos < total else None
                         if pick is not None:
                             queue_pos += 1
@@ -873,6 +911,7 @@ class Daemon:
                         result = cast("RunResult | None", parts[2])
                         if result is not None:
                             results.append(result)
+                            emit_reports(result)
                         worker_stats.append(cast("WorkerStats", parts[3]))
                         sel.unregister(conn)
                         conn.close()
@@ -971,6 +1010,31 @@ def request_run(address: str, *, full_report: bool = False) -> dict[str, object]
                 continue
             print("\r" + " " * 32 + "\r", end="", flush=True)  # erase the progress line
             return frame
+
+
+def request_run_streamed(address: str, on_report: Callable[[dict[str, object]], None]) -> dict[str, object]:
+    """Client for full-report **streaming** (the `pytest --fast` plugin controller). Triggers a
+    run in stream mode, invokes `on_report(serialized_report)` for each per-phase report as it
+    arrives, and returns the final frame (`{rc, summary}` or `{stale: True}`).
+
+    The controller replays the streamed reports through its own real terminalreporter, so native
+    pytest reporting (--durations / junit / -v/-s / plugins) all work — while the warm forkserver
+    daemon does the actual execution (amortized collect, fork-warm workers)."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    with _short_unix_path(address) as connect_path:
+        sock.connect(connect_path)
+    with sock:
+        _send(sock, ("run", _env_fingerprint(), True, True))  # full_report + stream
+        while True:
+            raw, _ = _recv(sock)
+            if not isinstance(raw, dict):
+                return {"rc": 1, "summary": "[pytest-fast] daemon closed connection mid-run"}
+            frame = cast("dict[str, object]", raw)  # daemon frame: report | stale | rc/summary
+            rep = frame.get("report")
+            if rep is not None:
+                on_report(cast("dict[str, object]", rep))
+                continue
+            return frame  # stale | {rc, summary}
 
 
 # ── orchestration: ensure resident daemon + run / stale-restart ──────────────
@@ -1357,26 +1421,37 @@ def _coordinated_spawn(workers: int, start_method: str, address: str, ttl: float
         _spawn_daemon(workers, start_method, address, ttl)
 
 
-def _ensure_and_run(
-    workers: int, start_method: str, address: str, ttl: float, *, with_watcher: bool, full_report: bool = False
-) -> int:
-    """Connect to the daemon at `address` → run. Spawns the daemon if absent and
-    restarts it if the daemon reports stale code. With `with_watcher` — also
-    guarantees a background watcher (pre-warm on source changes)."""
+def _run_via_daemon(
+    workers: int,
+    start_method: str,
+    address: str,
+    ttl: float,
+    *,
+    with_watcher: bool,
+    run: Callable[[str], dict[str, object]],
+) -> dict[str, object]:
+    """Ensure a resident daemon at `address`, then execute `run(address)` against it —
+    spawning the daemon if absent and respawning it on a `{stale}` reply, bounded by the
+    boot deadline. Returns the final frame from `run` (`{rc, summary}`), or `{rc: 1}` if the
+    daemon never came up / kept reporting stale. Shared by the CLI client (`_ensure_and_run`)
+    and the `--fast` plugin controller (`pytest_runtestloop`).
+
+    Stale is detected by the daemon BEFORE it runs anything (it replies `{stale}` and exits),
+    so a streaming `run` that gets respawned never double-emits reports."""
     if with_watcher:
         _ensure_watcher(workers, start_method, address, ttl)
     deadline = time.monotonic() + _DAEMON_BOOT_TIMEOUT
     spawned = False
     while True:
         try:
-            reply = request_run(address, full_report=full_report)
+            reply = run(address)
         except (FileNotFoundError, ConnectionRefusedError):
             if not spawned:
                 _coordinated_spawn(workers, start_method, address, ttl)
                 spawned = True
             if time.monotonic() > deadline:
                 print("[pytest-fast] daemon failed to start in time", file=sys.stderr)
-                return 1
+                return {"rc": 1}
             time.sleep(_DAEMON_BACKOFF_AFTER_SPAWN)
             continue
         if reply.get("stale"):
@@ -1388,14 +1463,128 @@ def _ensure_and_run(
                 # one socket, or a watched file with a future mtime) — give up at the deadline
                 # instead of spinning the client forever.
                 print("[pytest-fast] daemon kept reporting stale past boot deadline", file=sys.stderr)
-                return 1
+                return {"rc": 1}
             time.sleep(_DAEMON_BACKOFF_AFTER_STALE)  # let the old release the socket and the new boot
             continue
-        summary = reply.get("summary")
-        if summary is not None:
-            print(summary)
-        rc = reply.get("rc")
-        return rc if isinstance(rc, int) else 1
+        return reply
+
+
+def _ensure_and_run(
+    workers: int, start_method: str, address: str, ttl: float, *, with_watcher: bool, full_report: bool = False
+) -> int:
+    """CLI client (front A): connect to the daemon → run → print the daemon-rendered summary."""
+    reply = _run_via_daemon(
+        workers,
+        start_method,
+        address,
+        ttl,
+        with_watcher=with_watcher,
+        run=lambda addr: request_run(addr, full_report=full_report),
+    )
+    summary = reply.get("summary")
+    if summary is not None:
+        print(summary)
+    rc = reply.get("rc")
+    return rc if isinstance(rc, int) else 1
+
+
+# ── pytest plugin front-end (`pytest -p pytest_fast --fast`) ─────────────────
+#
+# Run the suite through the resident warm daemon while THIS process stays a real pytest
+# session — so native reporting (terminalreporter, --durations, junit, -v/-s, plugins) all
+# work: we just republish the daemon's streamed per-phase reports through the controller's
+# own `pytest_runtest_logreport` hook (the same mechanism xdist uses). The forkserver daemon
+# does the execution (amortized collect + fork-warm workers), so it stays fast across reruns.
+#
+# The hooks are INERT unless --fast is passed (like xdist with -n), so loading `-p pytest_fast`
+# for the OUTCOME_DUMP reference mode is unaffected.
+
+
+def _default_fast_address() -> str:
+    """Per-project daemon socket when --fast-address isn't given: a short, stable name in
+    TMPDIR derived from the project root (so two checkouts don't share one daemon)."""
+    slug = hashlib.sha1(str(_project_root()).encode()).hexdigest()[:10]
+    return f"{tempfile.gettempdir()}/pytest-fast-{slug}.sock"
+
+
+def pytest_addoption(parser: Parser) -> None:
+    group = parser.getgroup("pytest-fast", "resident forkserver accelerator")
+    group.addoption(
+        "--fast",
+        action="store_true",
+        default=False,
+        help="run the suite via a resident pytest-fast daemon (warm forkserver workers, native reporting)",
+    )
+    group.addoption("--fast-address", default=None, help="daemon unix socket (default: derived from the project root)")
+    group.addoption("--fast-workers", type=int, default=6, help="worker count for --fast (default 6)")
+    group.addoption("--fast-ttl", type=float, default=600.0, help="daemon idle TTL seconds for --fast (default 600)")
+    group.addoption(
+        "--fast-watch",
+        action="store_true",
+        default=False,
+        help="also keep a background watcher pre-warming the daemon on source changes",
+    )
+
+
+def pytest_runtestloop(session: Session) -> bool | None:
+    """When --fast: hand execution to the resident daemon and republish its streamed reports
+    through this controller's hooks (native reporting). Returns True (loop handled). Inert
+    (returns None → pytest's normal in-process loop) otherwise."""
+    config = session.config
+    if not config.getoption("fast", default=False):
+        return None
+    if session.testsfailed and not config.getvalue("continue_on_collection_errors"):
+        raise session.Interrupted(f"{session.testsfailed} error(s) during collection")
+
+    address = config.getoption("fast_address") or _default_fast_address()
+    workers = cast("int", config.getoption("fast_workers"))  # default=6 → never None
+    ttl = cast("float", config.getoption("fast_ttl"))  # default=600.0 → never None
+    with_watcher = bool(config.getoption("fast_watch"))
+
+    collected = {item.nodeid for item in session.items}
+    seen: set[str] = set()
+
+    def on_report(data: dict[str, object]) -> None:
+        rep = config.hook.pytest_report_from_serializable(config=config, data=data)
+        seen.add(rep.nodeid)
+        # Republish into the controller's real terminalreporter / plugins / pass-fail accounting.
+        config.hook.pytest_runtest_logreport(report=rep)
+
+    reply = _run_via_daemon(
+        workers,
+        "forkserver",
+        address,
+        ttl,
+        with_watcher=with_watcher,
+        run=lambda addr: request_run_streamed(addr, on_report),
+    )
+
+    # Collection-match guard: the daemon runs its OWN full collected suite. If THIS controller
+    # collected a different set (e.g. a -k/-m filter or explicit paths — not yet forwarded to
+    # the daemon), reports won't line up. Fail loudly rather than silently under/over-report.
+    missing = collected - seen
+    extra = seen - collected
+    if missing or extra:
+        import pytest
+
+        detail = ""
+        if missing:
+            detail += f" {len(missing)} collected test(s) got no report (e.g. {sorted(missing)[:3]})."
+        if extra:
+            detail += f" {len(extra)} reported test(s) weren't collected here (e.g. {sorted(extra)[:3]})."
+        raise pytest.UsageError(
+            "--fast: the daemon ran a different test set than this session collected."
+            + detail
+            + " Test selection (-k/-m/paths) isn't forwarded to the daemon yet — run the full suite with"
+            " --fast, or drop --fast for filtered runs."
+        )
+
+    rc = reply.get("rc")
+    if rc not in (0, None) and not session.testsfailed:
+        # Daemon flagged the run untrusted (worker crash / result undercount) but no republished
+        # report marked a failure — surface it so a green exit can't hide a broken run.
+        session.shouldfail = "pytest-fast: daemon reported an untrusted run (see daemon log)"
+    return True
 
 
 # ── source watcher (--watch): pre-warm staging successor, then promote ────────
