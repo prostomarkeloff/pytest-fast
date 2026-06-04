@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import selectors
 import socket
 import struct
 import subprocess
@@ -40,7 +39,6 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from pytest_fast import (
-    Daemon,
     _await_ready,
     _recv,
     _send,
@@ -205,7 +203,61 @@ def test_f2_zero_workers_is_not_a_silent_false_green(tmp_path: Path, pf_cmd: lis
 # ── F3: resident daemon must close its per-run selector ──────────────────────
 
 
-def test_f3_serve_bus_closes_its_selector(tmp_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+# Driver run in a SUBPROCESS (not in-process): the suite is dogfooded through
+# pytest-fast's own daemonic workers (`make test-full`), and a daemonic process may
+# not spawn multiprocessing children — `Daemon._run_once()` would raise "daemonic
+# processes are not allowed to have children". A plain subprocess sidesteps that:
+# its main process is non-daemonic, so forkserver workers spawn fine. The driver
+# installs a selector close-spy and exits 0 iff every per-run selector was closed.
+_F3_DRIVER = """\
+import os
+import selectors
+import sys
+
+import pytest_fast as pf
+
+created = []
+closed = []
+real_cls = selectors.DefaultSelector
+
+
+def factory():
+    sel = real_cls()
+    created.append(sel)
+    real_close = sel.close
+
+    def tracked_close():
+        closed.append(sel)
+        real_close()
+
+    # Per-instance override (pure-Python selector → has __dict__). _serve_bus calls
+    # `sel.close()`, and a `with selectors.DefaultSelector() as sel:` fix routes its
+    # __exit__ through the same close — so this records the close either way.
+    sel.close = tracked_close
+    return sel
+
+
+selectors.DefaultSelector = factory
+
+
+def main():
+    d = pf.Daemon(num_workers=2, start_method="forkserver")
+    d._run_once()  # warmup boot (forkserver spin-up)
+    d._run_once()  # measured run
+    if not created:
+        print("no selector created by _serve_bus", file=sys.stderr)
+        sys.exit(2)
+    leaked = len(created) - len(closed)
+    print(f"created={len(created)} closed={len(closed)} leaked={leaked}")
+    sys.exit(0 if leaked == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def test_f3_serve_bus_closes_its_selector(tmp_project: Path, tmp_path: Path) -> None:
     """`_serve_bus` creates a `selectors.DefaultSelector()` and never closes it. The
     selector participates in a reference cycle (BaseSelector ↔ _SelectorMapping), so
     refcounting won't free it — its kqueue/epoll fd survives until cyclic GC. In a
@@ -215,39 +267,25 @@ def test_f3_serve_bus_closes_its_selector(tmp_project: Path, monkeypatch: pytest
     Precise, non-flaky check: spy on every selector instance and assert each one is
     closed. (An empirically-confirmed fd-count probe showed exactly +1 fd/run, fully
     reclaimed by gc.collect() — i.e. the unclosed cyclic selector.)"""
-    monkeypatch.setenv("PYTEST_FAST_ROOT", str(tmp_project))
-
-    created: list[object] = []
-    closed: list[object] = []
-    real_cls = selectors.DefaultSelector
-
-    def _spy_factory() -> selectors.BaseSelector:
-        sel = real_cls()
-        created.append(sel)
-        real_close = sel.close
-
-        def _tracked_close() -> None:
-            closed.append(sel)
-            real_close()
-
-        # Per-instance override (pure-Python selector → has __dict__). _serve_bus calls
-        # `sel.close()`, and a `with selectors.DefaultSelector() as sel:` fix routes its
-        # __exit__ through the same close — so this records the close either way.
-        sel.close = _tracked_close
-        return sel
-
-    monkeypatch.setattr(selectors, "DefaultSelector", _spy_factory)
-
-    d = Daemon(num_workers=2, start_method="forkserver")
-    d._run_once()  # warmup boot (forkserver spin-up)
-    d._run_once()  # measured run
-
-    assert created, "expected _serve_bus to create a selectors.DefaultSelector"
-    leaked = len(created) - len(closed)
-    assert leaked == 0, (
-        f"{leaked} of {len(created)} per-run selector(s) were never closed — "
-        f"_serve_bus must close its selector (e.g. `with selectors.DefaultSelector() as sel:` "
-        f"or sel.close() in a finally), else a long-lived --serve daemon leaks an fd per run"
+    driver = tmp_path / "fd_drive.py"
+    driver.write_text(_F3_DRIVER)
+    env = os.environ.copy()
+    env["PYTEST_FAST_ROOT"] = str(tmp_project)
+    env.pop("_PYTEST_FAST_COLLECT", None)  # don't double-collect in the driver's own main
+    proc = subprocess.run(
+        [sys.executable, str(driver)],
+        cwd=str(tmp_project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (
+        f"per-run selector(s) were never closed — _serve_bus must close its selector "
+        f"(e.g. `with selectors.DefaultSelector() as sel:` or sel.close() in a finally), "
+        f"else a long-lived --serve daemon leaks an fd per run.\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
 
 
