@@ -49,6 +49,8 @@ def fast_env(tmp_project: Path, tmp_address: str) -> Iterator[tuple[Path, str]]:
 
 
 def _run(project: Path, address: str, *args: str) -> subprocess.CompletedProcess[str]:
+    # No `-p pytest_fast`: the pytest11 entry point auto-loads the plugin, so `--fast` is
+    # available out of the box — that's the path we want to exercise.
     env = os.environ.copy()
     env["PYTEST_FAST_ROOT"] = str(project)
     env.pop("_PYTEST_FAST_COLLECT", None)
@@ -57,8 +59,6 @@ def _run(project: Path, address: str, *args: str) -> subprocess.CompletedProcess
             sys.executable,
             "-m",
             "pytest",
-            "-p",
-            "pytest_fast",
             "--fast",
             "--fast-address",
             address,
@@ -122,14 +122,14 @@ def test_fast_watch_spawns_a_watcher(fast_env: tuple[Path, str]) -> None:
 
 
 def test_plugin_inert_without_fast_flag(tmp_project: Path) -> None:
-    """Loading `-p pytest_fast` WITHOUT --fast must not hijack the loop: pytest runs the
-    suite in-process as usual (and no daemon is spawned)."""
+    """The auto-loaded plugin (pytest11 entry point) must be INERT without --fast: plain
+    `pytest` runs the suite in-process as usual and spawns no daemon."""
     _make_project(tmp_project)
     env = os.environ.copy()
     env["PYTEST_FAST_ROOT"] = str(tmp_project)
     env.pop("_PYTEST_FAST_COLLECT", None)
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", "pytest_fast", "-q"],
+        [sys.executable, "-m", "pytest", "-q"],  # no --fast, no -p: entry point loads it, inert
         cwd=str(tmp_project),
         env=env,
         capture_output=True,

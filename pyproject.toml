@@ -13,6 +13,12 @@ dependencies = [
 [project.scripts]
 pytest-fast = "pytest_fast:main_cli"
 
+# Auto-register as a pytest plugin so `pytest --fast` works without `-p pytest_fast`.
+# The hooks are inert unless --fast is passed (like xdist without -n), and the daemon's
+# own collection / worker protocol never invoke pytest_runtestloop, so there's no recursion.
+[project.entry-points.pytest11]
+pytest_fast = "pytest_fast"
+
 [dependency-groups]
 dev = [
     "pyinstrument>=5.0",

@@ -22,8 +22,16 @@ Modes (CLI `pytest-fast` or `python -m pytest_fast`):
         verify collect, soft-shutdown the old one, promote to canonical). Exits once
         the daemon is gone via its own idle-ttl. Single-instance via flock.
   * `--runs N` / `--dump PATH`:     local in-process run.
-  * `-p pytest_fast` (as a plugin): when OUTCOME_DUMP is set, writes {nodeid: outcome} —
-        a reference dump for outcome-diff comparison against xdist.
+
+Also a pytest plugin (auto-loaded via the `pytest11` entry point):
+  * `pytest --fast`:                run the suite through the resident daemon while staying a
+        real pytest session — the daemon streams full per-phase reports, which we republish
+        through the controller's hooks → fully NATIVE reporting (terminalreporter, --durations,
+        -v/-s, junit, plugins, exit code) on top of warm fork-server execution. Forwards the
+        collected selection (-k/-m). `--fast-address/-workers/-ttl/-watch` tune it. Inert
+        unless `--fast` is passed (so a plain `pytest` run is unaffected).
+  * `OUTCOME_DUMP=PATH pytest -p pytest_fast`: writes {nodeid: outcome} — a reference dump for
+        outcome-diff comparison against xdist.
 
 Behaviorally identical to xdist (same test set; marks/skip/xfail/reruns 1-to-1 —
 runs go through the FULL pytest protocol `pytest_runtest_protocol`); reports are lossy.
