@@ -92,15 +92,33 @@ def test_fast_native_output_and_exit_code(fast_env: tuple[Path, str]) -> None:
     assert "test_fail" in out and "boom" in out  # native FAILURES traceback
 
 
-def test_fast_collection_mismatch_guard(fast_env: tuple[Path, str]) -> None:
-    """A filtered run (`-k`) collects a subset on the controller while the daemon runs the
-    whole suite → the collection-match guard fails loudly (UsageError, exit 4)."""
+def test_fast_k_filter_runs_subset(fast_env: tuple[Path, str]) -> None:
+    """`-k` selection is forwarded to the daemon: it runs ONLY the selected test (not the
+    whole suite), and pytest's native deselection display is correct."""
     project, address = fast_env
     proc = _run(project, address, "-k", "test_fast")
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 4, f"expected UsageError exit 4 for a filtered --fast run.\n{out}"
-    assert "--fast" in out and "different test set" in out
-    assert "isn't forwarded" in out
+    assert proc.returncode == 0, f"-k test_fast selects only a passing test → rc 0.\n{out}"
+    assert "1 passed" in out
+    assert "deselected" in out, f"native deselection display missing:\n{out}"
+    # the failing test must NOT have run (it was deselected)
+    assert "test_fail" not in out or "FAILED" not in out
+
+
+def test_fast_watch_spawns_a_watcher(fast_env: tuple[Path, str]) -> None:
+    """`--fast-watch` wires the pre-warm watcher into the plugin path: a watcher process is
+    ensured for the daemon (it writes its own log). The watcher's promote mechanics are
+    covered by test_watcher.py; here we just confirm the plugin spawns one."""
+    import time
+
+    project, address = fast_env
+    proc = _run(project, address, "--fast-watch")
+    assert proc.returncode == 1, proc.stdout + proc.stderr  # tmp project has a failing test
+    watcher_log = Path(address.removesuffix(".sock") + "-watcher.log")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not watcher_log.exists():
+        time.sleep(0.1)
+    assert watcher_log.exists(), "--fast-watch did not spawn a watcher (no watcher log)"
 
 
 def test_plugin_inert_without_fast_flag(tmp_project: Path) -> None:
