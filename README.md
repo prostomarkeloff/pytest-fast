@@ -85,15 +85,21 @@ FAILED tests/api/test_auth.py::test_invalid_token - assert 200 == 401
 
 That's **real pytest output**, not a re-implementation. How: your `pytest` process stays the controller (a real pytest session with a real `terminalreporter`); `pytest_runtestloop` hands execution to the resident daemon; the daemon runs your tests in warm fork workers and **streams full per-phase reports** back; the controller republishes each through its own `pytest_runtest_logreport` hook — the same mechanism xdist uses. So everything subscribed to that hook (terminal, durations, junit, html, coverage-ish, custom plugins, exit-code accounting) just works.
 
-| option | default | meaning |
-|---|---|---|
-| `--fast` | off | run via the resident daemon (otherwise pytest runs normally) |
-| `--fast-address PATH` | derived from project root | daemon Unix socket |
-| `--fast-workers N` | 6 | worker count |
-| `--fast-ttl SECONDS` | 600 | daemon idle TTL |
-| `--fast-watch` | off | also keep a pre-warm watcher running (see below) |
+| option | env var | default | meaning |
+|---|---|---|---|
+| `--fast` | — | off | run via the resident daemon (otherwise pytest runs normally) |
+| `--fast-address PATH` | `PYTEST_FAST_ADDRESS` | derived from project root | daemon Unix socket |
+| `--fast-workers N` | `PYTEST_FAST_WORKERS` | **performance cores** | worker count (auto-detected, see [Workers](#workers-why-the-default-is-performance-cores)) |
+| `--fast-ttl SECONDS` | `PYTEST_FAST_TTL` | 600 | daemon idle TTL |
+| `--fast-watch` | — | off | also keep a pre-warm watcher running (see below) |
+
+> ⚠ **Set the address via `PYTEST_FAST_ADDRESS` (or the `=` form `--fast-address=PATH`)**, not the bare space form. pytest computes its rootdir/inifile from the raw argv *before any plugin loads*, scanning it for existing paths — so once the daemon's socket file exists, a bare `--fast-address /tmp/x.sock` makes pytest root at `/tmp` and silently lose `pythonpath`/`pytest.ini`. The env var and the `=` form keep the path out of that scan. (This is a pytest limitation a plugin can't intercept.)
 
 **Selection** (`-k`, `-m`) is forwarded — the daemon runs exactly the tests your session collected. **Caveat:** explicit path/nodeid args (`pytest --fast tests/x.py::test_y`) can produce rootdir-relative nodeids that don't line up with the daemon's collection (an xdist-class issue); when that happens the run fails loudly with a clear message rather than silently mis-reporting. Use `-k`/`-m` or a full run.
+
+### Workers: why the default is performance cores
+
+The default worker count is the number of **performance cores**, not the logical CPU count. On Apple Silicon (and other big.LITTLE designs) cores split into performance (P) and efficiency (E) cores; E-cores run ~half the throughput. The work-stealing dispatcher finishes when the **slowest** worker drains, so a worker scheduled onto an E-core becomes a straggler that bounds the whole run — more workers than P-cores doesn't speed things up, it adds stragglers plus memory/scheduler contention. So pytest-fast pins to the P-core count (macOS: `hw.perflevel0.physicalcpu`; e.g. 6 on a 6P+6E machine), falling back to the logical CPU count elsewhere. Override with `--fast-workers` / `--workers` / `PYTEST_FAST_WORKERS`.
 
 ---
 
@@ -251,6 +257,9 @@ If you need Windows or remote fan-out across machines — use xdist. If you spen
 | `PYTEST_FAST_MARK` | `""` | string | Marker expression, passed as `-m` during collection. |
 | `PYTEST_ADDOPTS` | (inherited) | pytest opts | Standard pytest addopts. In the env fingerprint → a change forces respawn. |
 | `PYTEST_FAST_ENV_PREFIXES` | `""` | comma-separated | Env-var prefixes whose change forces respawn. Mark your app config: `MYAPP_,FEATURE_`. |
+| `PYTEST_FAST_ADDRESS` | (derived) | path | Daemon socket — used by **both** the CLI runner and `pytest --fast`. Prefer this over a bare `--fast-address` path (see the `--fast` caveat above). |
+| `PYTEST_FAST_WORKERS` | (perf cores) | int | Worker count for both front-ends. |
+| `PYTEST_FAST_TTL` | `600` | seconds | Daemon idle TTL for both front-ends. |
 | `OUTCOME_DUMP` | `""` | path | With `pytest -p pytest_fast`, writes `{nodeid: outcome}` JSON on sessionfinish — a reference dump for outcome-diff against xdist. |
 
 All listed variables are in the env fingerprint; changing any forces a fresh daemon (you never need to manually kill one).
@@ -271,9 +280,9 @@ pytest --fast                # or: pytest-fast --address /tmp/myapp.sock --worke
 ### CLI flags (`pytest-fast`)
 
 ```
---address PATH       Unix socket of the resident daemon (caller picks the path)
---ttl SECONDS        Idle seconds before daemon self-shutdown (default 600)
---workers N          Parallel worker count (default 6, must be >= 1)
+--address PATH       Unix socket of the resident daemon (or $PYTEST_FAST_ADDRESS)
+--ttl SECONDS        Idle seconds before daemon self-shutdown (or $PYTEST_FAST_TTL; default 600)
+--workers N          Parallel worker count (or $PYTEST_FAST_WORKERS; default: performance cores, >= 1)
 --start-method M     spawn / forkserver / fork (default forkserver)
 --full-report        Ship full per-phase reports → a real --durations table in the summary
 --with-watcher       Spawn a pre-warm watcher alongside the daemon

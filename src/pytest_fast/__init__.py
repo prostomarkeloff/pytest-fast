@@ -1539,11 +1539,76 @@ def _ensure_and_run(
 # for the OUTCOME_DUMP reference mode is unaffected.
 
 
+def _default_workers() -> int:
+    """Default worker count — the number of PERFORMANCE cores.
+
+    On Apple Silicon (and other big.LITTLE designs) cores split into performance (P) and
+    efficiency (E) cores; E-cores run roughly half the throughput. The work-stealing dispatch
+    finishes when the SLOWEST worker drains, so a worker scheduled onto an E-core becomes a
+    straggler that bounds the whole run — more workers than P-cores doesn't speed things up,
+    it just adds stragglers plus memory/scheduler contention. So default to the P-core count
+    (macOS: `hw.perflevel0.physicalcpu`). Other platforms fall back to the logical CPU count."""
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "hw.perflevel0.physicalcpu"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            n = int(out.stdout.strip())
+            if n > 0:
+                return n
+        except (OSError, ValueError):
+            pass  # not Apple Silicon / sysctl unavailable → fall through
+    return os.cpu_count() or 1
+
+
+def _resolve_workers(cli_value: int | None) -> int:
+    """Worker count precedence: explicit CLI/option value → `PYTEST_FAST_WORKERS` env →
+    performance-core auto-detect (`_default_workers`)."""
+    if cli_value is not None:
+        return cli_value
+    env = os.environ.get("PYTEST_FAST_WORKERS")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    return _default_workers()
+
+
+def _resolve_ttl(cli_value: float | None) -> float:
+    """Idle-TTL precedence: explicit CLI/option value → `PYTEST_FAST_TTL` env → 600s."""
+    if cli_value is not None:
+        return cli_value
+    env = os.environ.get("PYTEST_FAST_TTL")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    return 600.0
+
+
 def _default_fast_address() -> str:
-    """Per-project daemon socket when --fast-address isn't given: a short, stable name in
-    TMPDIR derived from the project root (so two checkouts don't share one daemon)."""
+    """Per-project daemon socket when no address is given: a short, stable name in TMPDIR
+    derived from the project root (so two checkouts don't share one daemon)."""
     slug = hashlib.sha1(str(_project_root()).encode()).hexdigest()[:10]
     return f"{tempfile.gettempdir()}/pytest-fast-{slug}.sock"
+
+
+def _resolve_fast_address(cli_value: str | None) -> str:
+    """Daemon address precedence: `--fast-address` option → `PYTEST_FAST_ADDRESS` env →
+    per-project default.
+
+    ⚠ Prefer `PYTEST_FAST_ADDRESS` (or `--fast-address=PATH`, with an `=`) over the space form
+    `--fast-address PATH`: pytest determines rootdir/inifile from the raw argv BEFORE any plugin
+    loads, scanning it for existing paths — so once the daemon's socket file exists, a bare
+    `--fast-address /tmp/x.sock` makes pytest root at `/tmp`, silently losing `pythonpath`/ini
+    discovery. The `=` form and the env var keep the path out of that positional scan."""
+    return cli_value or os.environ.get("PYTEST_FAST_ADDRESS") or _default_fast_address()
 
 
 def pytest_addoption(parser: Parser) -> None:
@@ -1554,9 +1619,25 @@ def pytest_addoption(parser: Parser) -> None:
         default=False,
         help="run the suite via a resident pytest-fast daemon (warm forkserver workers, native reporting)",
     )
-    group.addoption("--fast-address", default=None, help="daemon unix socket (default: derived from the project root)")
-    group.addoption("--fast-workers", type=int, default=6, help="worker count for --fast (default 6)")
-    group.addoption("--fast-ttl", type=float, default=600.0, help="daemon idle TTL seconds for --fast (default 600)")
+    group.addoption(
+        "--fast-address",
+        default=None,
+        help="daemon unix socket (or $PYTEST_FAST_ADDRESS; default: derived from the project root). "
+        "Use the '=' form (--fast-address=PATH) or the env var — a bare space-separated path can be "
+        "mistaken for the rootdir once the socket exists.",
+    )
+    group.addoption(
+        "--fast-workers",
+        type=int,
+        default=None,
+        help="worker count for --fast (or $PYTEST_FAST_WORKERS; default: performance-core count)",
+    )
+    group.addoption(
+        "--fast-ttl",
+        type=float,
+        default=None,
+        help="daemon idle TTL seconds for --fast (or $PYTEST_FAST_TTL; default 600)",
+    )
     group.addoption(
         "--fast-watch",
         action="store_true",
@@ -1575,9 +1656,9 @@ def pytest_runtestloop(session: Session) -> bool | None:
     if session.testsfailed and not config.getvalue("continue_on_collection_errors"):
         raise session.Interrupted(f"{session.testsfailed} error(s) during collection")
 
-    address = config.getoption("fast_address") or _default_fast_address()
-    workers = cast("int", config.getoption("fast_workers"))  # default=6 → never None
-    ttl = cast("float", config.getoption("fast_ttl"))  # default=600.0 → never None
+    address = _resolve_fast_address(cast("str | None", config.getoption("fast_address")))
+    workers = _resolve_workers(cast("int | None", config.getoption("fast_workers")))
+    ttl = _resolve_ttl(cast("float | None", config.getoption("fast_ttl")))
     with_watcher = bool(config.getoption("fast_watch"))
 
     collected = [item.nodeid for item in session.items]
@@ -1797,10 +1878,14 @@ def _watch(workers: int, start_method: str, address: str, ttl: float) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="pytest-fast: resident forkserver test accelerator")
-    parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument(
+        "--workers", type=int, default=None, help="worker count (or $PYTEST_FAST_WORKERS; default: performance cores)"
+    )
     parser.add_argument("--start-method", choices=["spawn", "forkserver", "fork"], default="forkserver")
-    parser.add_argument("--address", help="unix socket of the resident daemon (caller hardcodes this)")
-    parser.add_argument("--ttl", type=float, default=600.0, help="serve/ensure: idle seconds before self-shutdown")
+    parser.add_argument("--address", help="unix socket of the resident daemon (or $PYTEST_FAST_ADDRESS)")
+    parser.add_argument(
+        "--ttl", type=float, default=None, help="serve/ensure: idle seconds before self-shutdown (or $PYTEST_FAST_TTL)"
+    )
     parser.add_argument("--serve", action="store_true", help="be the resident daemon (needs --address)")
     parser.add_argument(
         "--watch", action="store_true", help="(internal) be the resident source watcher (needs --address)"
@@ -1818,27 +1903,30 @@ def main(argv: list[str]) -> int:
         help="ship full per-phase reports → a real --durations table in the summary (heavier bus)",
     )
     ns = parser.parse_args(argv)
-    if ns.workers < 1:
+    workers = _resolve_workers(ns.workers)
+    ttl = _resolve_ttl(ns.ttl)
+    address = ns.address or os.environ.get("PYTEST_FAST_ADDRESS")
+    if workers < 1:
         parser.error("--workers must be >= 1")
 
     if ns.watch:
-        if not ns.address:
+        if not address:
             parser.error("--watch requires --address")
-        return _watch(ns.workers, ns.start_method, ns.address, ns.ttl)
+        return _watch(workers, ns.start_method, address, ttl)
     if ns.serve:
-        if not ns.address:
+        if not address:
             parser.error("--serve requires --address")
-        return Daemon(num_workers=ns.workers, start_method=ns.start_method).serve(ns.address, ns.ttl)
-    if ns.address:
+        return Daemon(num_workers=workers, start_method=ns.start_method).serve(address, ttl)
+    if address:
         return _ensure_and_run(
-            ns.workers,
+            workers,
             ns.start_method,
-            ns.address,
-            ns.ttl,
+            address,
+            ttl,
             with_watcher=ns.with_watcher,
             full_report=ns.full_report,
         )
-    return Daemon(num_workers=ns.workers, start_method=ns.start_method, dump_path=ns.dump).run(
+    return Daemon(num_workers=workers, start_method=ns.start_method, dump_path=ns.dump).run(
         ns.runs, full_report=ns.full_report
     )
 
