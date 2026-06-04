@@ -19,6 +19,9 @@ dev = [
     "pyright>=1.1.409",
     "ruff>=0.15.14",
 ]
+xdist-parity = [
+    "pytest-xdist>=3.8.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.8.1,<0.9.0"]
