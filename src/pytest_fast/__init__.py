@@ -242,7 +242,14 @@ def _recv(sock: socket.socket) -> tuple[object, int]:
     payload = _recvn(sock, length)
     if payload is None:
         return None, 4
-    return _loads(payload), length + 4
+    try:
+        return _loads(payload), length + 4
+    except Exception:
+        # A zero-length or corrupt/hostile payload makes `_loads` raise (EOFError,
+        # UnpicklingError, …). That's a corrupted frame, not a fatal condition — return the
+        # same sentinel as a truncated payload; callers (master, daemon, client) already
+        # treat that as "corrupted frame / peer gone" and close the connection.
+        return None, length + 4
 
 
 # ── pytest-faithful test outcome categorization ──────────────────────────────
@@ -259,7 +266,9 @@ def categorize(config: Config, reports: list[TestReport]) -> str:
         cat = config.hook.pytest_report_teststatus(report=rep, config=config)[0]
         if not cat or cat == "rerun":
             continue
-        p = _OUTCOME_PRIORITY.get(cat, 0)
+        p = _OUTCOME_PRIORITY.get(cat)
+        if p is None:
+            continue  # unrecognized category (unknown third-party plugin) — don't let it win over passed
         if p > best_p:
             best, best_p = cat, p
     return best
@@ -447,9 +456,13 @@ def _worker_main(wid: int, sock_path: str) -> None:
     while True:
         _send(sock, ("req", wid, pending))
         reply, _ = _recv(sock)
+        # Master gone / malformed reply → break out and exit cleanly (os._exit below). The
+        # master sees EOF and the run is flagged untrusted via the result undercount.
+        if not isinstance(reply, tuple) or len(reply) < 2:
+            break
         idx_msg = cast("tuple[object, object]", reply)  # master → ('idx', pick)
         idx = idx_msg[1]
-        cur = items[idx] if isinstance(idx, int) else None
+        cur = items[idx] if isinstance(idx, int) and 0 <= idx < len(items) else None
         if prev is not None:
             t0 = time.perf_counter()
             if faulthandler_mod is not None:
@@ -522,6 +535,7 @@ def pytest_sessionfinish(session: object) -> None:
 class Daemon:
     def __init__(self, num_workers: int, start_method: str, dump_path: str | None = None) -> None:
         super().__init__()
+        assert num_workers >= 1, "num_workers must be >= 1"
         self.num_workers = num_workers
         self.start_method = start_method
         self.dump_path = dump_path
@@ -597,8 +611,8 @@ class Daemon:
                     return 0
                 with conn:
                     msg, _ = _recv(conn)
-                    if not isinstance(msg, tuple):
-                        continue  # empty/garbled connect (ping/probe)
+                    if not isinstance(msg, tuple) or not msg:
+                        continue  # empty/garbled connect (ping/probe) or empty tuple
                     parts = cast("tuple[object, ...]", msg)  # control: (cmd, *args)
                     cmd = parts[0]
                     # Slice for fp, NOT `parts[1] if len(parts) > 1`: the len() guard makes
@@ -613,7 +627,20 @@ class Daemon:
                         _log("daemon", "shutdown requested — exiting")
                         return 0  # finally releases socket+pid
                     if cmd == "promote":
-                        new_addr = str(parts[1])
+                        # Derive new_addr from the fp_args slice (not parts[1]) to keep pyright's
+                        # tuple-arity narrowing happy (see the fp_args comment above).
+                        if not fp_args:
+                            continue  # malformed promote (no address)
+                        new_addr = str(fp_args[0])
+                        # A promote may only retarget within the SAME directory as the current
+                        # address (staging→canonical are siblings). The control socket is
+                        # connectable by any same-user process and new_addr flows into
+                        # _redirect_stdio's log path — an arbitrary path would let a stray/hostile
+                        # peer redirect the daemon's stdio. Reject anything else.
+                        if Path(new_addr).parent != Path(cur).parent or new_addr == cur:
+                            _send(conn, {"promoted": False})
+                            _log("daemon", f"refused promote to unexpected address {new_addr!r}")
+                            continue
                         ctl.close()
                         _remove_pid(cur)
                         Path(cur).unlink(missing_ok=True)
@@ -635,7 +662,7 @@ class Daemon:
                     rc, summary = self._run_once(progress_conn=conn)
                     try:
                         _send(conn, {"rc": rc, "summary": summary})
-                    except (BrokenPipeError, ConnectionError, OSError):
+                    except OSError:
                         # client gone (Ctrl-C) before the final frame — the run is already done,
                         # the daemon does NOT crash (used to crash on BrokenPipe here), stays warm
                         _log("daemon", "client gone before summary; run completed, staying warm")
@@ -719,80 +746,96 @@ class Daemon:
         # Worker connect with timeout: if a forked worker died BEFORE connect (warmup
         # crash), we don't block in accept() forever — start with whoever made it.
         sel = selectors.DefaultSelector()
-        server.settimeout(_WORKER_ACCEPT_TIMEOUT)
-        for _ in range(self.num_workers):
-            try:
-                conn, _addr = server.accept()
-            except TimeoutError:
-                break
-            sel.register(conn, selectors.EVENT_READ)
-        server.settimeout(None)
-        expected = len(sel.get_map())
+        # try/finally so the selector's kernel fd (kqueue/epoll) is always closed: the
+        # selector is part of a reference cycle (BaseSelector ↔ its map), so refcounting
+        # alone won't free it until cyclic GC — and the resident daemon gc.freeze()s at boot
+        # and rarely GCs → one leaked fd per run → eventual EMFILE.
+        try:
+            server.settimeout(_WORKER_ACCEPT_TIMEOUT)
+            for _ in range(self.num_workers):
+                try:
+                    conn, _addr = server.accept()
+                except TimeoutError:
+                    break
+                sel.register(conn, selectors.EVENT_READ)
+            server.settimeout(None)
+            expected = len(sel.get_map())
 
-        total: int | None = None
-        queue_pos = 0
-        results: list[RunResult] = []
-        worker_stats: list[WorkerStats] = []
-        tx = rx = req_count = 0
-        t_ready = 0.0
-        ready_seen = 0
-        active = expected
-        last_emit = 0.0
+            total: int | None = None
+            queue_pos = 0
+            results: list[RunResult] = []
+            worker_stats: list[WorkerStats] = []
+            tx = rx = req_count = 0
+            t_ready = 0.0
+            ready_seen = 0
+            active = expected
+            last_emit = 0.0
 
-        def emit_progress(*, force: bool = False) -> None:
-            nonlocal progress_conn, last_emit
-            if progress_conn is None or total is None:
-                return
-            now = time.perf_counter()
-            done = len(results)
-            if not force and done < total and now - last_emit < _PROGRESS_THROTTLE_SEC:
-                return  # throttled to _PROGRESS_THROTTLE_SEC; the final frame (done==total) is always sent
-            last_emit = now
-            try:
-                _send(progress_conn, {"progress": (done, total)})
-            except (BrokenPipeError, ConnectionError, OSError):
-                progress_conn = None  # client gone (Ctrl-C) — stop sending, but complete the run
+            def emit_progress(*, force: bool = False) -> None:
+                nonlocal progress_conn, last_emit
+                if progress_conn is None or total is None:
+                    return
+                now = time.perf_counter()
+                done = len(results)
+                if not force and done < total and now - last_emit < _PROGRESS_THROTTLE_SEC:
+                    return  # throttled to _PROGRESS_THROTTLE_SEC; the final frame (done==total) is always sent
+                last_emit = now
+                try:
+                    _send(progress_conn, {"progress": (done, total)})
+                except OSError:
+                    progress_conn = None  # client gone (Ctrl-C) — stop sending, but complete the run
 
-        while active > 0:
-            for key, _mask in sel.select():
-                conn = key.fileobj
-                assert isinstance(conn, socket.socket)
-                msg, nbytes = _recv(conn)
-                rx += nbytes
-                if not isinstance(msg, tuple):
-                    sel.unregister(conn)
-                    conn.close()
-                    active -= 1
-                    continue
-                parts = cast("tuple[object, ...]", msg)  # worker msg: ('ready'|'req'|'fin', …)
-                kind = parts[0]
-                if kind == "ready":
-                    total = cast("int", parts[2])
-                    ready_seen += 1
-                    if ready_seen == expected:
-                        t_ready = time.perf_counter()
-                elif kind == "req":
-                    result = cast("RunResult | None", parts[2])
-                    if result is not None:
-                        results.append(result)
-                        emit_progress()
-                    pick = queue_pos if total is not None and queue_pos < total else None
-                    if pick is not None:
-                        queue_pos += 1
-                    tx += _send(conn, ("idx", pick))
-                    req_count += 1
-                else:  # "fin"
-                    result = cast("RunResult | None", parts[2])
-                    if result is not None:
-                        results.append(result)
-                    worker_stats.append(cast("WorkerStats", parts[3]))
-                    sel.unregister(conn)
-                    conn.close()
-                    active -= 1
+            while active > 0:
+                for key, _mask in sel.select():
+                    conn = key.fileobj
+                    assert isinstance(conn, socket.socket)
+                    msg, nbytes = _recv(conn)
+                    rx += nbytes
+                    if not isinstance(msg, tuple):
+                        sel.unregister(conn)
+                        conn.close()
+                        active -= 1
+                        continue
+                    parts = cast("tuple[object, ...]", msg)  # worker msg: ('ready'|'req'|'fin', …)
+                    kind = parts[0]
+                    if kind == "ready":
+                        total = cast("int", parts[2])
+                        ready_seen += 1
+                        if ready_seen == expected:
+                            t_ready = time.perf_counter()
+                    elif kind == "req":
+                        result = cast("RunResult | None", parts[2])
+                        if result is not None:
+                            results.append(result)
+                            emit_progress()
+                        pick = queue_pos if total is not None and queue_pos < total else None
+                        if pick is not None:
+                            queue_pos += 1
+                        try:
+                            tx += _send(conn, ("idx", pick))
+                        except OSError:
+                            # Worker died after sending 'req' (rare). Treat as a disconnect and
+                            # finish the run — the result undercount (and the worker's nonzero
+                            # exitcode) flag it untrusted in _run_once, rather than crashing the daemon.
+                            sel.unregister(conn)
+                            conn.close()
+                            active -= 1
+                            continue
+                        req_count += 1
+                    else:  # "fin"
+                        result = cast("RunResult | None", parts[2])
+                        if result is not None:
+                            results.append(result)
+                        worker_stats.append(cast("WorkerStats", parts[3]))
+                        sel.unregister(conn)
+                        conn.close()
+                        active -= 1
 
-        emit_progress(force=True)  # final frame (done==total) — guaranteed
-        bus = {"tx": float(tx), "rx": float(rx), "req_count": float(req_count)}
-        return results, worker_stats, bus, t_ready, total or 0
+            emit_progress(force=True)  # final frame (done==total) — guaranteed
+            bus = {"tx": float(tx), "rx": float(rx), "req_count": float(req_count)}
+            return results, worker_stats, bus, t_ready, total or 0
+        finally:
+            sel.close()
 
     def _report(
         self,
@@ -1176,10 +1219,20 @@ def _redirect_stdio(path: Path) -> None:
     the daemon was spawned with stdout→staging-log, after rebinding to canonical its
     lifecycle logs should land in canonical's log (otherwise the "current" daemon writes
     into …-daemon.staging.log → debugging confusion). dup2 copies the fd over 1/2;
-    sys.stdout/sys.stderr (wrappers around fd 1/2) then automatically write to the new file."""
-    with path.open("a") as f:
-        os.dup2(f.fileno(), 1)
-        os.dup2(f.fileno(), 2)
+    sys.stdout/sys.stderr (wrappers around fd 1/2) then automatically write to the new file.
+
+    O_NOFOLLOW: refuse to follow a symlink at the log path. The control socket is connectable
+    by any same-user process, so a stray/hostile peer could pre-plant a symlink there to capture
+    the daemon's stdio. On any open error we keep the current stdio rather than crash."""
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return
+    try:
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+    finally:
+        os.close(fd)
 
 
 def _self_invocation() -> list[str]:
@@ -1271,6 +1324,12 @@ def _ensure_and_run(workers: int, start_method: str, address: str, ttl: float, *
             print("[pytest-fast] sources/env changed — restarting daemon (fresh collect)", file=sys.stderr)
             _coordinated_spawn(workers, start_method, address, ttl)
             spawned = True
+            if time.monotonic() > deadline:
+                # Perpetual staleness (e.g. two callers with different env fingerprints sharing
+                # one socket, or a watched file with a future mtime) — give up at the deadline
+                # instead of spinning the client forever.
+                print("[pytest-fast] daemon kept reporting stale past boot deadline", file=sys.stderr)
+                return 1
             time.sleep(_DAEMON_BACKOFF_AFTER_STALE)  # let the old release the socket and the new boot
             continue
         summary = reply.get("summary")
@@ -1347,8 +1406,15 @@ def _staging_promote(workers: int, start_method: str, address: str, ttl: float) 
             _remove_pid(staging)
             return False
         _shutdown_daemon(address)  # blocks until the current run finishes — we don't tear it
-        _await_socket_gone(address, 30.0)  # old's finally released the canonical socket → we can bind
-        return _promote(staging, address)
+        if not _await_socket_gone(address, 30.0):
+            # Old daemon never released the canonical socket (stuck in a very long run). Abort
+            # rather than bind over a live socket; shut the staging successor so it isn't orphaned.
+            _log("watcher", "old daemon didn't release canonical socket — aborting promote")
+            _shutdown_daemon(staging)
+            Path(staging).unlink(missing_ok=True)
+            _remove_pid(staging)
+            return False
+        return _promote(staging, address)  # old's finally released the canonical socket → we can bind
 
 
 def _spawn_watcher(workers: int, start_method: str, address: str, ttl: float, cwd: str | None = None) -> None:
@@ -1464,6 +1530,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--runs", type=int, default=1, help="local single-process mode: number of in-process runs")
     parser.add_argument("--dump", help="local mode: write {nodeid: outcome} JSON (for the outcome-diff harness)")
     ns = parser.parse_args(argv)
+    if ns.workers < 1:
+        parser.error("--workers must be >= 1")
 
     if ns.watch:
         if not ns.address:
