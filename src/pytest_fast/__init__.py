@@ -371,6 +371,16 @@ def _collect() -> None:
         config.hook.pytest_sessionstart(session=session)
         config.hook.pytest_collection(session=session)
         collected_config, collected_items = config, session.items
+        # Reap collect-time cyclic garbage BEFORE freezing. Importing test modules leaves
+        # transient garbage that only cyclic GC reclaims — notably stale pre-slots classes
+        # from `@attrs.define`/`@dataclass(slots=True)`, which linger as DUPLICATES in their
+        # base's `__subclasses__()` until collected. `gc.freeze()` pins whatever is live into
+        # the permanent generation, so without this collect first, those duplicates are
+        # frozen forever and every forked worker inherits a polluted `__subclasses__()` —
+        # breaking libraries that walk it (e.g. cattrs `include_subclasses`). Plain pytest
+        # avoids this because natural GC runs between collect and the test; the forkserver
+        # forks immediately, so we must reap explicitly here.
+        gc.collect()
         gc.freeze()  # heap (app+items) into the permanent generation → GC won't scan shared COW pages
     finally:
         collect_done.set()  # watchdog thread exits quietly (success or exception — no stack dump)
