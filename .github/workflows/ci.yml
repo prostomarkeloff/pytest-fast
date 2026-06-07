@@ -123,3 +123,26 @@ jobs:
             oom-*
             timeout-*
           if-no-files-found: ignore
+
+  # Differential parity: the engine's per-test outcomes must match plain pytest & xdist.
+  # Needs the xdist-parity group; POSIX only (the engine is forkserver-based).
+  parity:
+    name: parity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install Python 3.13
+        run: uv python install 3.13
+      - name: Sync deps (with xdist-parity)
+        run: uv sync --frozen --python 3.13 --group xdist-parity
+      - name: Run parity tier
+        run: make test-parity
+        shell: bash

@@ -1,4 +1,4 @@
-.PHONY: lint-heavy test-full test-stress fuzz-install fuzz-seeds fuzz clean
+.PHONY: lint-heavy test-full test-stress test-parity fuzz-install fuzz-seeds fuzz clean
 
 UV ?= uv
 
@@ -43,13 +43,19 @@ lint-heavy:
 # spawn their own daemons and Hypothesis loops and belong in `make test-stress` / the
 # dedicated CI job, not every dogfood run.
 test-full:
-	PYTEST_FAST_MARK="not fuzz and not stress" $(UV) run pytest-fast --address $(PYTEST_FAST_SOCK) --workers 4 --ttl 600
+	PYTEST_FAST_MARK="not fuzz and not stress and not parity" $(UV) run pytest-fast --address $(PYTEST_FAST_SOCK) --workers 4 --ttl 600
 
 # The opt-in fuzz + stress tier (Hypothesis property tests, live-daemon fuzzing,
 # resource-exhaustion). Run via PLAIN pytest (not the dogfood daemon): these spawn
 # their own subprocess daemons. `HYPOTHESIS_PROFILE=ci` derandomizes for reproducibility.
 test-stress:
 	HYPOTHESIS_PROFILE=ci $(UV) run pytest -m "fuzz or stress" -p no:cacheprovider
+
+# Differential parity tier: the engine's per-test outcomes must match plain pytest & xdist.
+# `--group xdist-parity` pulls in pytest-xdist for the xdist leg without permanently changing
+# the synced env. Each generated suite spawns three subprocess runners, so this is slow.
+test-parity:
+	HYPOTHESIS_PROFILE=ci $(UV) run --group xdist-parity pytest -m parity -p no:cacheprovider
 
 # ── Atheris coverage-guided fuzzing (POSIX; libFuzzer) ───────────────────────────
 # Atheris is NOT a pyproject dependency: it targets py3.11–3.13 (the test matrix goes to

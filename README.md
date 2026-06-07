@@ -313,6 +313,7 @@ uv sync
 make lint-heavy     # ruff format + ruff check --fix + pyright
 make test-full      # run pytest-fast's own tests through pytest-fast (dogfood)
 make test-stress    # opt-in fuzz + stress tier (Hypothesis), via plain pytest
+make test-parity    # opt-in differential parity tier (engine vs plain pytest vs xdist)
 make fuzz           # Atheris coverage-guided fuzzing of the wire decoder (needs: make fuzz-install)
 ```
 
@@ -320,9 +321,11 @@ The unit suite covers the bus protocol & malformed-frame robustness, env fingerp
 
 On top of that, an **opt-in fuzz + stress tier** (`@pytest.mark.fuzz` / `@pytest.mark.stress`, [Hypothesis](https://hypothesis.readthedocs.io)-driven, excluded from the default run) hammers the attack surface: property-based fuzzing of the wire codec (round-trip, arbitrary-bytes robustness, the `_SafeUnpickler` whitelist / RCE resistance, fragmentation, the oversized-frame guard, decode-amplification / memo / class-as-value rejection); fuzzing of the pure aggregation helpers (`categorize`, the `--durations` table, env/fingerprint parsing); and live-daemon stress — Hypothesis-generated frame storms, a slowloris idle-connection check, a connection flood, mid-run worker-crash → UNTRUSTED accounting, and fd-leak hygiene across many runs. Run it with `make test-stress` (sets `HYPOTHESIS_PROFILE=ci` → derandomized, 300 examples/property).
 
+There's also a **differential parity tier** (`@pytest.mark.parity`, `make test-parity`): it generates synthetic suites spanning every outcome (pass / fail / error / skip / xfail / xpass / parametrize) and runs each three ways — **plain pytest (the oracle) ↔ the pytest-fast engine ↔ pytest-xdist** — asserting the `{nodeid: outcome}` maps match exactly (Hypothesis shrinks any divergence to a minimal suite). This is the guard against the warm-forkserver engine ever drifting from a normal pytest session. Needs the `xdist-parity` group.
+
 Deeper still, **`make fuzz`** runs [Atheris](https://github.com/google/atheris) (coverage-guided, libFuzzer-backed) against the pickle decoder — see [`fuzz/`](fuzz/). It already surfaced (and pinned regressions for) a decode-amplification OOM, a memo-index pre-allocation bomb, a whitelist class-as-value escape, and a memo-DAG traversal blow-up. Crashers it finds are curated into `fuzz/corpus/` and replayed on every PR by `tests/test_fuzz_corpus.py` — no Atheris required for the replay.
 
-CI runs lint, an `os: [ubuntu, macos, windows] × python: [3.11–3.14]` matrix for the unit suite (skipped on Windows — POSIX only), the fuzz + stress tier as a dedicated `os: [ubuntu, macos]` job, and a nightly/​dispatch Atheris fuzzing job on Linux.
+CI runs lint, an `os: [ubuntu, macos, windows] × python: [3.11–3.14]` matrix for the unit suite (skipped on Windows — POSIX only), the fuzz + stress and parity tiers as dedicated `os: [ubuntu, macos]` jobs, and a nightly/​dispatch Atheris fuzzing job on Linux.
 
 ---
 
