@@ -15,15 +15,24 @@ A resident `forkserver`-based pytest accelerator. The first run boots a daemon t
 
 Two ways to drive it, one warm engine underneath:
 
+- **`pytest-fast --address …`** — a standalone CLI. A thin client triggers the daemon and prints a lean, bespoke summary. **Lowest overhead** — the fast path for the tight TDD loop and CI.
 - **`pytest --fast`** — a pytest plugin. Your `pytest` invocation stays a real pytest session, so reporting is **100% native** (terminal, `--durations`, `-v/-s`, `--junitxml`, plugins, exit codes) — the warm daemon just does the execution.
-- **`pytest-fast --address …`** — a standalone CLI. A thin client triggers the daemon and prints a lean, bespoke summary. Lowest overhead; great for tight TDD loops and CI.
+
+> ### ⚠ The two front-ends are NOT equally fast — this is the most important thing to know
+>
+> **`pytest --fast` is much slower than `pytest-fast --address`.** Because the plugin keeps your `pytest` process a *real* session, it **re-pays the controller-side import + collection on every run** — loading conftest, plugins, and your whole app graph (the very ~4–5 s cost this tool exists to amortize). Only the *execution* is warm; the cold start comes back on the controller.
+>
+> The thin CLI `pytest-fast --address` skips all of that — the client just pings the resident daemon, which already holds the collected suite — so warmup ≈ `fork()` and a warm rerun is **sub-second**.
+>
+> **Rule of thumb:** reach for **`pytest-fast --address`** by default (tight loops, CI, anything where you re-run constantly). Use **`pytest --fast` only when you actually need native reporting** — `--junitxml`, native `-v`, third-party report plugins — and can eat the per-run controller-side cold start. (It's still far faster than cold `xdist`, which re-pays that import *N* times; it's just nowhere near the CLI.)
 
 ```bash
 uv add git+https://github.com/prostomarkeloff/pytest-fast.git
 ```
 
 ```bash
-pytest --fast                 # native pytest output, warm forkserver execution
+pytest-fast --address /tmp/myproj.sock    # the fast path — warm rerun ≈ fork(), sub-second
+pytest --fast                             # native pytest output, but re-pays controller import each run
 ```
 
 > **POSIX only** (uses `forkserver` / `AF_UNIX` / `fcntl`). On Windows, use `pytest-xdist`.
@@ -55,6 +64,8 @@ The speed win lives entirely in **collection amortization** — it's independent
 ## `pytest --fast` — the plugin (native reporting)
 
 Auto-registered via pytest's `pytest11` entry point, so it works out of the box — no `-p` needed. It's **inert unless you pass `--fast`** (exactly like `xdist` is inert without `-n`), so a plain `pytest` run is completely unaffected.
+
+> ⚠ **Slower than the CLI runner.** `pytest --fast` re-pays the controller-side import + collection every run (see the callout above) — choose it for native reporting, not for raw speed. For the fastest loop, use [`pytest-fast --address`](#pytest-fast--the-cli-runner-lean--fast).
 
 ```bash
 pytest --fast                          # whole suite, native output, via the warm daemon
@@ -182,10 +193,10 @@ client / pytest ─►   │  DAEMON (main process)               │
 
 ### Two front-ends, one engine
 
-The warm forkserver + work-stealing bus is shared. The only difference is **who renders the report**:
+The warm forkserver + work-stealing bus is shared. The difference is **who renders the report — and what the client side costs**:
 
-- **CLI runner** — the daemon itself renders the bespoke summary and the thin client prints it. Lowest overhead.
-- **`--fast` plugin** — the daemon streams full, serialized per-phase reports; the pytest controller republishes them into its own real `terminalreporter`. Because the daemon is resident, the controller's config/reporter cost is paid once and amortized — so you get native reporting *and* warmth, which a per-run cold controller (xdist) cannot.
+- **CLI runner** — the daemon itself renders the bespoke summary and the thin client just prints it. The client does **no collection and no app import**, so it's the lowest-overhead path (warm rerun ≈ `fork()`).
+- **`--fast` plugin** — the controller IS a real pytest session: it imports your app graph and **collects every run** (to know which nodeids to forward), then `pytest_runtestloop` hands execution to the daemon and republishes the streamed per-phase reports through its own real `terminalreporter`. So you get native reporting on top of warm execution — but the controller-side import/collect is **re-paid on every invocation** (it is *not* amortized by the resident daemon; only the workers are warm). That's why `pytest --fast` is much slower than the CLI runner, while still beating cold `xdist` (which re-pays that import on *every worker*).
 
 Full reports cross the bus as plain-builtins dicts (`pytest_report_to_serializable`), so the pickle whitelist (below) is unchanged. The bus is heavier in full-report mode (~6× per test — longrepr + captured sections) but it's a local Unix socket, negligible against test time. `_MAX_FRAME_BYTES` is 256 MB.
 
@@ -312,9 +323,20 @@ uv sync
 
 make lint-heavy     # ruff format + ruff check --fix + pyright
 make test-full      # run pytest-fast's own tests through pytest-fast (dogfood)
+make test-stress    # opt-in fuzz + stress tier (Hypothesis), via plain pytest
+make test-parity    # opt-in differential parity tier (engine vs plain pytest vs xdist)
+make fuzz           # Atheris coverage-guided fuzzing of the wire decoder (needs: make fuzz-install)
 ```
 
-The suite covers the bus protocol & malformed-frame robustness, env fingerprint & watch-root parsing, daemon lifecycle (spawn / status / run / shutdown / idle-ttl), the watcher (flock single-instance / promote / no-promote on broken collect), full-report wire format, the `pytest --fast` plugin (native output, selection forwarding, inert-without-`--fast`), and CLI smoke. CI runs lint plus an `os: [ubuntu, macos, windows] × python: [3.11–3.14]` matrix (tests are skipped on Windows — POSIX only).
+The unit suite covers the bus protocol & malformed-frame robustness, env fingerprint & watch-root parsing, daemon lifecycle (spawn / status / run / shutdown / idle-ttl), the watcher (flock single-instance / promote / no-promote on broken collect), full-report wire format, the `pytest --fast` plugin (native output, selection forwarding, inert-without-`--fast`), and CLI smoke.
+
+On top of that, an **opt-in fuzz + stress tier** (`@pytest.mark.fuzz` / `@pytest.mark.stress`, [Hypothesis](https://hypothesis.readthedocs.io)-driven, excluded from the default run) hammers the attack surface: property-based fuzzing of the wire codec (round-trip, arbitrary-bytes robustness, the `_SafeUnpickler` whitelist / RCE resistance, fragmentation, the oversized-frame guard, decode-amplification / memo / class-as-value rejection); fuzzing of the pure aggregation helpers (`categorize`, the `--durations` table, env/fingerprint parsing); and live-daemon stress — Hypothesis-generated frame storms, a slowloris idle-connection check, a connection flood, mid-run worker-crash → UNTRUSTED accounting, and fd-leak hygiene across many runs. Run it with `make test-stress` (sets `HYPOTHESIS_PROFILE=ci` → derandomized, 300 examples/property).
+
+There's also a **differential parity tier** (`@pytest.mark.parity`, `make test-parity`): it generates synthetic suites spanning every outcome (pass / fail / error / skip / xfail / xpass / parametrize) and runs each three ways — **plain pytest (the oracle) ↔ the pytest-fast engine ↔ pytest-xdist** — asserting the `{nodeid: outcome}` maps match exactly (Hypothesis shrinks any divergence to a minimal suite). This is the guard against the warm-forkserver engine ever drifting from a normal pytest session. Needs the `xdist-parity` group.
+
+Deeper still, **`make fuzz`** runs [Atheris](https://github.com/google/atheris) (coverage-guided, libFuzzer-backed) against the pickle decoder — see [`fuzz/`](fuzz/). It already surfaced (and pinned regressions for) a decode-amplification OOM, a memo-index pre-allocation bomb, a whitelist class-as-value escape, and a memo-DAG traversal blow-up. Crashers it finds are curated into `fuzz/corpus/` and replayed on every PR by `tests/test_fuzz_corpus.py` — no Atheris required for the replay.
+
+CI runs lint, an `os: [ubuntu, macos, windows] × python: [3.11–3.14]` matrix for the unit suite (skipped on Windows — POSIX only), the fuzz + stress and parity tiers as dedicated `os: [ubuntu, macos]` jobs, and a nightly/​dispatch Atheris fuzzing job on Linux.
 
 ---
 

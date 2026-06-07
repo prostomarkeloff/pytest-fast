@@ -179,6 +179,25 @@ def _short_unix_path(address: str) -> Iterator[str]:
 # chunky frame; 256MB is generous headroom while still bounding a corrupt/hostile header.
 _MAX_FRAME_BYTES = 256 * 1024 * 1024
 
+# Cap on the number of pickle opcodes `_loads` will accept (decode-amplification guard).
+# `_MAX_FRAME_BYTES` bounds the WIRE size but NOT the decoded object size: pickle memo
+# back-references let a small frame fan out into a large object graph, and a bogus
+# length-prefixed opcode makes the C unpickler pre-allocate gigabytes from a ~5-byte frame.
+# Every constructed node costs ≥1 opcode, so bounding the opcode count bounds both the
+# decoded node count and the cost of `_is_plain_builtins`. 1M is 10×+ above any real frame
+# (a forwarded selection of N tests is ~N opcodes; no suite has a million tests). Found by
+# the Atheris harness.
+_MAX_PICKLE_OPS = 1_000_000
+
+# Opcodes whose integer arg drives a C-unpickler PRE-ALLOCATION (the memo array resize for
+# PUT/GET indices, the read-ahead buffer for a FRAME length) rather than being plain data.
+# The C unpickler allocates from these BEFORE bounds-checking, so a ~5-byte LONG_BINPUT with
+# a 2-billion index grows the memo to ~18 GB. `_loads` rejects any whose arg exceeds the
+# frame size — a valid pickle never references or declares more than its own bytes. (1-byte
+# BINPUT/BINGET are capped at 255 → harmless; string/bytes lengths are already caught by
+# genops, which reads the data and fails 'truncated' on a bogus length.) Found by Atheris.
+_ALLOC_ARG_OPCODES = frozenset({"FRAME", "LONG_BINPUT", "PUT", "LONG_BINGET", "GET"})
+
 
 # Whitelist for `_SafeUnpickler.find_class`. Our wire protocol carries:
 #   - control messages: tuple/dict/str/int/float/bool/None/bytes
@@ -221,17 +240,100 @@ class _SafeUnpickler(pickle.Unpickler):
         raise pickle.UnpicklingError(msg)
 
 
-def _loads(data: bytes) -> object:
-    """Safe analog of `pickle.loads` — routed through `_SafeUnpickler`."""
-    import io
+# Concrete builtin VALUE types the bus legitimately carries. `_loads` rejects a decoded
+# result containing anything else — notably a builtin *class* object. `find_class` must
+# hand back builtin classes (`complex`, `frozenset`, …) so REDUCE can reconstruct their
+# INSTANCES, but a frame that returns the class ITSELF as a value (`cbuiltins\ncomplex\n.`)
+# is never legitimate protocol data. Not an RCE — every whitelisted class is a safe
+# constructor — but it tightens the bus to plain data only (found by the Atheris harness).
+_BUS_VALUE_TYPES = (type(None), bool, int, float, complex, str, bytes, bytearray, tuple, list, dict, set, frozenset)
 
-    return _SafeUnpickler(io.BytesIO(data)).load()
+
+def _is_plain_builtins(obj: object) -> bool:
+    """Iterative check that `obj` is composed solely of plain builtin VALUES — no class /
+    callable objects. Iterative (no recursion → no RecursionError on deep nesting) AND
+    identity-deduplicated: a pickle memo 'billion laughs' DAG (`m=[m,m]` ×N) is tiny in
+    memory via shared refs, but a naive walk visits 2^N paths and OOMs — tracking visited
+    ids collapses it to the number of DISTINCT objects (bounded by `_MAX_PICKLE_OPS`)."""
+    stack = [obj]
+    seen: set[int] = set()
+    while stack:
+        o = stack.pop()
+        oid = id(o)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        if type(o) not in _BUS_VALUE_TYPES:
+            return False
+        if isinstance(o, dict):
+            stack.extend(o.keys())
+            stack.extend(o.values())
+        elif isinstance(o, list | tuple | set | frozenset):
+            stack.extend(o)
+    return True
+
+
+def _loads(data: bytes) -> object:
+    """Safe analog of `pickle.loads` — routed through `_SafeUnpickler`, behind a pre-scan
+    and a post-check. Three layers, three threats:
+
+      * whitelist (`_SafeUnpickler.find_class`) → no RCE (only builtins deserialize);
+      * pre-scan (`pickletools.genops`) → no decode-amplification OOM: the C unpickler
+        pre-allocates a buffer for a length-prefixed opcode BEFORE checking the bytes are
+        present, so a ~5-byte frame claiming gigabytes OOMs the process under
+        `_MAX_FRAME_BYTES` entirely; genops reads from a BytesIO so a bogus length reads
+        short and raises (no allocation), and `_MAX_PICKLE_OPS` caps memo-based fan-out;
+      * post-check (`_is_plain_builtins`) → the result must be plain builtin *data*; a frame
+        returning a builtin *class* as a value (allowed by find_class for REDUCE) is rejected.
+
+    Both extra checks were driven by the Atheris harness (fuzz/fuzz_wire.py)."""
+    import io
+    import pickletools
+
+    n_ops = 0
+    data_len = len(data)
+    try:
+        for opcode, arg, _pos in pickletools.genops(data):
+            n_ops += 1
+            if n_ops > _MAX_PICKLE_OPS:
+                msg = f"pickle exceeds the opcode budget ({_MAX_PICKLE_OPS})"
+                raise pickle.UnpicklingError(msg)
+            if isinstance(arg, int) and arg > data_len and opcode.name in _ALLOC_ARG_OPCODES:
+                msg = f"{opcode.name} arg {arg} exceeds the {data_len}-byte frame (pre-allocation guard)"
+                raise pickle.UnpicklingError(msg)
+    except pickle.UnpicklingError:
+        raise
+    except Exception as exc:
+        # genops raised on a malformed / oversized-length frame — reject before it can
+        # reach the C unpickler and pre-allocate. Normalize to UnpicklingError so callers
+        # (`_recv`) treat it as a corrupt frame, exactly like any other decode failure.
+        msg = f"malformed pickle rejected before decode: {exc!r}"
+        raise pickle.UnpicklingError(msg) from exc
+    result = _SafeUnpickler(io.BytesIO(data)).load()
+    if not _is_plain_builtins(result):
+        msg = "decoded a non-data object (a builtin class/callable); the bus carries plain values only"
+        raise pickle.UnpicklingError(msg)
+    return result
 
 
 def _send(sock: socket.socket, obj: object) -> int:
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     sock.sendall(struct.pack("!I", len(data)) + data)
     return len(data) + 4
+
+
+def _try_send(sock: socket.socket, obj: object) -> bool:
+    """Best-effort control reply. A same-user peer that disconnects BEFORE reading its
+    reply (e.g. a `status` client that hit its own recv timeout while the daemon was
+    momentarily busy) would otherwise make `sendall` raise BrokenPipe/ConnectionReset
+    and CRASH the resident daemon. The state change the reply accompanies (shutdown,
+    promote, stale-exit) must still proceed, so we swallow the error and report it.
+    Returns False if the peer was already gone."""
+    try:
+        _send(sock, obj)
+    except OSError:
+        return False
+    return True
 
 
 def _recvn(sock: socket.socket, n: int) -> bytes | None:
@@ -424,7 +526,10 @@ def _durations_lines(results: list[RunResult], limit: int = 15, min_dur: float =
     for r in results:
         for rep in r.get("reports", []):
             dur, when, nodeid = rep.get("duration"), rep.get("when"), rep.get("nodeid")
-            if isinstance(dur, int | float) and isinstance(when, str) and isinstance(nodeid, str):
+            # `dur == dur` filters NaN (nan != nan): a NaN duration from a malformed/
+            # hostile serialized report poisons `list.sort()` below (NaN comparisons are
+            # all False → the sort silently leaves the table mis-ordered).
+            if isinstance(dur, int | float) and dur == dur and isinstance(when, str) and isinstance(nodeid, str):
                 phases.append((float(dur), when, nodeid))
     phases.sort(reverse=True)
     shown = [p for p in phases if p[0] >= min_dur][:limit]
@@ -671,7 +776,20 @@ class Daemon:
                     _log("daemon", f"idle > {ttl}s — shutting down")
                     return 0
                 with conn:
-                    msg, _ = _recv(conn)
+                    # Bound the command read against a "slowloris" peer: the accept loop is
+                    # serial, so a same-user process that connects and sends nothing (or a
+                    # partial header) would otherwise block this blocking `_recv` forever and
+                    # wedge the daemon for everyone. Legitimate clients send the whole command
+                    # frame up front (it's already in the socket buffer by the time we accept),
+                    # so a short read deadline never trips them. TimeoutError ⊂ OSError.
+                    conn.settimeout(_CONTROL_CMD_TIMEOUT)
+                    try:
+                        msg, _ = _recv(conn)
+                    except OSError:
+                        continue  # stalled / reset peer — drop it, keep serving
+                    # A run streams progress/reports for as long as the suite takes; clear the
+                    # deadline so a long but healthy run isn't aborted mid-stream.
+                    conn.settimeout(None)
                     if not isinstance(msg, tuple) or not msg:
                         continue  # empty/garbled connect (ping/probe) or empty tuple
                     parts = cast("tuple[object, ...]", msg)  # control: (cmd, *args)
@@ -681,10 +799,14 @@ class Daemon:
                     fp_args = parts[1:]
                     client_fp = str(fp_args[0]) if fp_args else None  # caller env fingerprint
                     if cmd == "status":
-                        _send(conn, {"ready": True, "stale": _stale_reason(boot_mtime, boot_fp, client_fp) is not None})
+                        # _try_send (not _send): a status client that already hit its own recv
+                        # timeout and disconnected must not crash us with a BrokenPipe on reply.
+                        _try_send(
+                            conn, {"ready": True, "stale": _stale_reason(boot_mtime, boot_fp, client_fp) is not None}
+                        )
                         continue
                     if cmd == "shutdown":
-                        _send(conn, {"bye": True})
+                        _try_send(conn, {"bye": True})  # reply best-effort; shut down regardless
                         _log("daemon", "shutdown requested — exiting")
                         return 0  # finally releases socket+pid
                     if cmd == "promote":
@@ -699,7 +821,7 @@ class Daemon:
                         # _redirect_stdio's log path — an arbitrary path would let a stray/hostile
                         # peer redirect the daemon's stdio. Reject anything else.
                         if Path(new_addr).parent != Path(cur).parent or new_addr == cur:
-                            _send(conn, {"promoted": False})
+                            _try_send(conn, {"promoted": False})
                             _log("daemon", f"refused promote to unexpected address {new_addr!r}")
                             continue
                         ctl.close()
@@ -708,14 +830,21 @@ class Daemon:
                         cur = new_addr
                         ctl = _bind_ctl(cur, ttl)
                         _redirect_stdio(_daemon_log_path(cur))  # lifecycle logs → log of the new address
-                        _send(conn, {"promoted": True})
+                        _try_send(conn, {"promoted": True})
                         _log("daemon", f"promoted → listening {cur}")
                         continue
-                    # default — this is a run request: ('run', fp[, full_report])
+                    if cmd != "run":
+                        # Unknown/garbage command from a same-user peer. Must be ignored, NOT
+                        # treated as a run: an arbitrary tuple like ('x', 'y') used to fall into
+                        # the run branch, where a non-matching fingerprint made the daemon reply
+                        # {stale} and EXIT — i.e. any stray frame could shut the resident daemon
+                        # down (a same-user DoS). Real clients always send the verb "run".
+                        continue
+                    # run request: ('run', fp[, full_report[, stream[, nodeids]]])
                     reason = _stale_reason(boot_mtime, boot_fp, client_fp)
                     if reason is not None:
                         _log("daemon", f"{reason} — exiting stale")
-                        _send(conn, {"stale": True})
+                        _try_send(conn, {"stale": True})  # best-effort; exit stale regardless
                         return 0  # finally releases the socket → client spawns a fresh daemon
                     # Optional args: ('run', fp, full_report[, stream[, nodeids]]). Old clients send
                     # only fp → lean. `stream` (the plugin controller) asks the daemon to stream the
@@ -1196,7 +1325,12 @@ def _env_fingerprint() -> str:
     prefixes = _fingerprint_prefixes()
     items = {k: v for k, v in os.environ.items() if k in _FINGERPRINT_KEYS or any(k.startswith(p) for p in prefixes)}
     blob = "\0".join(f"{k}={items[k]}" for k in sorted(items))
-    return hashlib.sha1(blob.encode()).hexdigest()
+    # `surrogateescape`, NOT a strict `.encode()`: a non-UTF-8 byte env value (common for
+    # an app var matched via PYTEST_FAST_ENV_PREFIXES) is decoded into os.environ as
+    # surrogate-escaped chars (\udc80–\udcff); strict UTF-8 then raises UnicodeEncodeError
+    # — and this runs on EVERY client request, so it would crash the whole run. The
+    # surrogateescape handler reverses the decode to the original bytes → stable + total.
+    return hashlib.sha1(blob.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def _stale_reason(boot_mtime: float, boot_fp: str, client_fp: str | None) -> str | None:
@@ -1248,7 +1382,11 @@ def _bind_ctl(address: str, ttl: float) -> socket.socket:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     with _short_unix_path(address) as bind_path:
         s.bind(bind_path)
-    s.listen(8)
+    # Generous backlog: the accept loop is serial (one control message at a time), so a
+    # burst of near-simultaneous probes (e.g. parallel `status` pings) can pile up faster
+    # than we accept them. 8 was small enough that a flood got connections refused; 64
+    # absorbs realistic bursts without dropping callers.
+    s.listen(64)
     s.settimeout(ttl)
     _write_pid(address)
     return s
@@ -1739,6 +1877,7 @@ _DEBOUNCE_POLL_INTERVAL = 0.1
 _WORKER_ACCEPT_TIMEOUT = 60.0  # seconds for each worker's connect to the master server
 _WORKER_JOIN_TIMEOUT = 10.0  # seconds master waits for a worker process to exit after `fin`
 _STATUS_PING_TIMEOUT = 2.0  # seconds for a status ping; a daemon busy with a run isn't in accept
+_CONTROL_CMD_TIMEOUT = 5.0  # seconds to read a control command before dropping the conn (anti-slowloris)
 _PROGRESS_THROTTLE_SEC = 0.1  # 10 frames/s; the final frame is force-flushed anyway
 
 # Daemon-spawn orchestration (only in `_ensure_and_run` / client side).

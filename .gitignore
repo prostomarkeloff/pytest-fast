@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# libFuzzer / Atheris artifacts dropped in the CWD on a finding. Reproducers worth keeping
+# are curated into fuzz/corpus/ (which IS tracked); these loose ones are not.
+crash-*
+oom-*
+timeout-*
+leak-*
+# Coverage-increasing units libFuzzer writes during a run go to a scratch dir, so the
+# curated fuzz/corpus/ stays clean and reviewable.
+fuzz/corpus-work/

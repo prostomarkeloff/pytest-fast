@@ -1,4 +1,4 @@
-.PHONY: lint-heavy test-full clean
+.PHONY: lint-heavy test-full test-stress test-parity fuzz-install fuzz-seeds fuzz clean
 
 UV ?= uv
 
@@ -38,8 +38,49 @@ lint-heavy:
 # Dogfood: run pytest-fast's own tests through pytest-fast itself. The daemon is
 # resident on a per-worktree socket; the first run boots (~3s), subsequent runs
 # reuse the warm forkserver (≈ fork() warmup).
+#
+# `PYTEST_FAST_MARK` (== collection `-m`) excludes the opt-in fuzz/stress tier: those
+# spawn their own daemons and Hypothesis loops and belong in `make test-stress` / the
+# dedicated CI job, not every dogfood run.
 test-full:
-	$(UV) run pytest-fast --address $(PYTEST_FAST_SOCK) --workers 4 --ttl 600
+	PYTEST_FAST_MARK="not fuzz and not stress and not parity" $(UV) run pytest-fast --address $(PYTEST_FAST_SOCK) --workers 4 --ttl 600
+
+# The opt-in fuzz + stress tier (Hypothesis property tests, live-daemon fuzzing,
+# resource-exhaustion). Run via PLAIN pytest (not the dogfood daemon): these spawn
+# their own subprocess daemons. `HYPOTHESIS_PROFILE=ci` derandomizes for reproducibility.
+test-stress:
+	HYPOTHESIS_PROFILE=ci $(UV) run pytest -m "fuzz or stress" -p no:cacheprovider
+
+# Differential parity tier: the engine's per-test outcomes must match plain pytest & xdist.
+# `--group xdist-parity` pulls in pytest-xdist for the xdist leg without permanently changing
+# the synced env. Each generated suite spawns three subprocess runners, so this is slow.
+test-parity:
+	HYPOTHESIS_PROFILE=ci $(UV) run --group xdist-parity pytest -m parity -p no:cacheprovider
+
+# ── Atheris coverage-guided fuzzing (POSIX; libFuzzer) ───────────────────────────
+# Atheris is NOT a pyproject dependency: it targets py3.11–3.13 (the test matrix goes to
+# 3.14) and on macOS must be built against a libFuzzer-capable clang. So it's installed
+# ad-hoc into the venv here. The corpus + tests/test_fuzz_corpus.py replay (which need NO
+# Atheris) are the durable per-PR guard; this is the deep, scheduled crash hunt.
+fuzz-install:
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		echo "macOS: building atheris against Homebrew LLVM (Apple clang lacks libFuzzer)"; \
+		CLANG_BIN="$$(brew --prefix llvm)/bin/clang" $(UV) pip install atheris; \
+	else \
+		$(UV) pip install atheris; \
+	fi
+
+fuzz-seeds:
+	$(UV) run python fuzz/make_seeds.py
+
+# Time-boxed coverage-guided run over the wire decoder. Override the budget with
+# `make fuzz FUZZ_TIME=600`. `-rss_limit_mb` turns a decode-amplification OOM into a finding.
+# New units are written to the gitignored scratch dir (first corpus arg); fuzz/corpus is
+# read-only seeds, so it stays curated. Both are read for coverage.
+FUZZ_TIME ?= 120
+fuzz: fuzz-seeds
+	@mkdir -p fuzz/corpus-work
+	$(UV) run python fuzz/fuzz_wire.py -max_total_time=$(FUZZ_TIME) -rss_limit_mb=2048 fuzz/corpus-work fuzz/corpus
 
 # Remove pyc/__pycache__ and the resident socket (next test-full will spawn a fresh daemon).
 clean:
