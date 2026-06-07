@@ -312,9 +312,17 @@ uv sync
 
 make lint-heavy     # ruff format + ruff check --fix + pyright
 make test-full      # run pytest-fast's own tests through pytest-fast (dogfood)
+make test-stress    # opt-in fuzz + stress tier (Hypothesis), via plain pytest
+make fuzz           # Atheris coverage-guided fuzzing of the wire decoder (needs: make fuzz-install)
 ```
 
-The suite covers the bus protocol & malformed-frame robustness, env fingerprint & watch-root parsing, daemon lifecycle (spawn / status / run / shutdown / idle-ttl), the watcher (flock single-instance / promote / no-promote on broken collect), full-report wire format, the `pytest --fast` plugin (native output, selection forwarding, inert-without-`--fast`), and CLI smoke. CI runs lint plus an `os: [ubuntu, macos, windows] × python: [3.11–3.14]` matrix (tests are skipped on Windows — POSIX only).
+The unit suite covers the bus protocol & malformed-frame robustness, env fingerprint & watch-root parsing, daemon lifecycle (spawn / status / run / shutdown / idle-ttl), the watcher (flock single-instance / promote / no-promote on broken collect), full-report wire format, the `pytest --fast` plugin (native output, selection forwarding, inert-without-`--fast`), and CLI smoke.
+
+On top of that, an **opt-in fuzz + stress tier** (`@pytest.mark.fuzz` / `@pytest.mark.stress`, [Hypothesis](https://hypothesis.readthedocs.io)-driven, excluded from the default run) hammers the attack surface: property-based fuzzing of the wire codec (round-trip, arbitrary-bytes robustness, the `_SafeUnpickler` whitelist / RCE resistance, fragmentation, the oversized-frame guard, decode-amplification / memo / class-as-value rejection); fuzzing of the pure aggregation helpers (`categorize`, the `--durations` table, env/fingerprint parsing); and live-daemon stress — Hypothesis-generated frame storms, a slowloris idle-connection check, a connection flood, mid-run worker-crash → UNTRUSTED accounting, and fd-leak hygiene across many runs. Run it with `make test-stress` (sets `HYPOTHESIS_PROFILE=ci` → derandomized, 300 examples/property).
+
+Deeper still, **`make fuzz`** runs [Atheris](https://github.com/google/atheris) (coverage-guided, libFuzzer-backed) against the pickle decoder — see [`fuzz/`](fuzz/). It already surfaced (and pinned regressions for) a decode-amplification OOM, a memo-index pre-allocation bomb, a whitelist class-as-value escape, and a memo-DAG traversal blow-up. Crashers it finds are curated into `fuzz/corpus/` and replayed on every PR by `tests/test_fuzz_corpus.py` — no Atheris required for the replay.
+
+CI runs lint, an `os: [ubuntu, macos, windows] × python: [3.11–3.14]` matrix for the unit suite (skipped on Windows — POSIX only), the fuzz + stress tier as a dedicated `os: [ubuntu, macos]` job, and a nightly/​dispatch Atheris fuzzing job on Linux.
 
 ---
 

@@ -21,6 +21,7 @@ pytest_fast = "pytest_fast"
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.155.2",
     "pyinstrument>=5.0",
     "pyright>=1.1.409",
     "ruff>=0.15.14",
@@ -32,6 +33,17 @@ xdist-parity = [
 [build-system]
 requires = ["uv_build>=0.8.1,<0.9.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+# The fuzz/stress layer is OPT-IN: a bare `pytest` (and the dogfood `make test-full`,
+# which passes its own non-empty `-m` that wins over this default) skips both markers.
+# The dedicated CI job re-includes them with `-m "fuzz or stress"` (a CLI `-m` overrides
+# this addopts one). See tests/test_fuzz_*.py / tests/test_stress_daemon.py.
+addopts = "-m 'not fuzz and not stress'"
+markers = [
+    "fuzz: property-based / fuzz tests (Hypothesis); deterministic, safe, opt-in",
+    "stress: heavy stress / resource-exhaustion tests against a live daemon; opt-in",
+]
 
 [tool.ruff]
 target-version = "py311"

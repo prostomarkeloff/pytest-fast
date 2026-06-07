@@ -11,6 +11,7 @@ flag via `_subprocess_env()` before passing env to the child. Tests that mutate
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,6 +20,30 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+
+# ── Hypothesis profiles (for the fuzz/stress layer) ──────────────────────────
+#
+# Determinism is a project value (see the dogfood / non-idempotent-rerun notes): the
+# `ci` profile `derandomize`s so a CI run is reproducible from the source alone, and
+# `deadline=None` kills time-based flakiness (socket/daemon round-trips vary on loaded
+# runners). `HYPOTHESIS_PROFILE` selects (default `dev`); the fuzz CI job sets `ci`.
+# Guarded import: the base suite (which skips the fuzz/stress markers) must stay
+# collectable even on a minimal install without hypothesis.
+try:
+    from hypothesis import HealthCheck, settings
+except ImportError:
+    pass
+else:
+    settings.register_profile("dev", max_examples=75, deadline=None)
+    settings.register_profile(
+        "ci",
+        max_examples=300,
+        derandomize=True,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    )
+    settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 
 
 @pytest.fixture

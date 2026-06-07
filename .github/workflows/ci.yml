@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 4 * * *" # nightly deep fuzz run
+  workflow_dispatch: # manual deep fuzz run
 
 # Cancel superseded runs on the same branch to save CI minutes.
 concurrency:
@@ -60,3 +63,63 @@ jobs:
         run: |
           echo "::warning::pytest-fast is POSIX-only (uses fcntl, AF_UNIX, forkserver). Windows support is future work — this job is a placeholder so the matrix surface stays visible."
         shell: bash
+
+  # Opt-in fuzz + stress tier (Hypothesis property tests, live-daemon fuzzing,
+  # resource-exhaustion / slowloris / worker-crash). Heavier and slower than the unit
+  # suite, so it runs as a dedicated job on POSIX only, one Python. `HYPOTHESIS_PROFILE=ci`
+  # (set by `make test-stress`) derandomizes for reproducibility.
+  stress:
+    name: stress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install Python 3.13
+        run: uv python install 3.13
+      - name: Sync deps
+        run: uv sync --frozen --python 3.13
+      - name: Run fuzz + stress tier
+        run: make test-stress
+        shell: bash
+
+  # Atheris coverage-guided fuzzing of the wire decoder. Non-deterministic, so it does NOT
+  # gate PRs (the deterministic corpus replay in the `stress` job covers those). Runs on
+  # main pushes, nightly, and manual dispatch, with a time budget. Linux only: Atheris ships
+  # a prebuilt libFuzzer wheel there (no clang build needed).
+  fuzz:
+    name: fuzz (atheris)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install Python 3.13
+        run: uv python install 3.13
+      - name: Sync deps
+        run: uv sync --frozen --python 3.13
+      - name: Install Atheris
+        run: uv pip install atheris
+      - name: Fuzz the wire decoder (300s)
+        run: |
+          mkdir -p fuzz/corpus-work
+          uv run python fuzz/fuzz_wire.py -max_total_time=300 -rss_limit_mb=2048 fuzz/corpus-work fuzz/corpus
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            crash-*
+            oom-*
+            timeout-*
+          if-no-files-found: ignore

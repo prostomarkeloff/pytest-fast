@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from pytest_fast import (
+    _MAX_FRAME_BYTES,
     _await_ready,
     _recv,
     _send,
@@ -54,7 +55,10 @@ if TYPE_CHECKING:
     from _pytest.config import Config
     from _pytest.reports import TestReport
 
-_MAX_FRAME = 64 * 1024 * 1024  # mirror of pytest_fast._MAX_FRAME_BYTES
+# Import the real cap (don't hard-code it): a stale local copy drifted below the actual
+# value, so the "oversized header" case below stopped exceeding the cap and silently
+# degraded into a truncated-frame test instead of exercising the size guard.
+_MAX_FRAME = _MAX_FRAME_BYTES
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
