@@ -736,6 +736,7 @@ _BENCH_TOP_CALLS = 20  # how many slowest CALL phases to classify
 _BENCH_MAX_LEVERS = 12
 _BENCH_IO_FRAC = 0.20  # cpu/total below this → I/O-bound
 _BENCH_CPU_FRAC = 0.80  # cpu/total above this → CPU-bound
+_BENCH_CV = 0.40  # per-test coefficient of variation above this (≥2 runs) → unstable timing
 
 
 def _phase_split(result: RunResult) -> tuple[float, float, float]:
@@ -772,6 +773,7 @@ def _bench_report(result_runs: list[list[RunResult]], run: float, cores: int, wa
     line = "═" * 66
     # Average each test's timings across the runs it appeared in: [appearances, total, cpu, s, c, t].
     acc: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    samples: dict[str, list[float]] = defaultdict(list)  # per-test total durations across runs → variance
     for results in result_runs:
         for r in results:
             s, c, t = _phase_split(r)
@@ -782,6 +784,7 @@ def _bench_report(result_runs: list[list[RunResult]], run: float, cores: int, wa
             a[3] += s
             a[4] += c
             a[5] += t
+            samples[r["nodeid"]].append(r["duration"])
     recs = [
         (nid, nid.split("::", 1)[0], a[1] / a[0], a[2] / a[0], a[3] / a[0], a[4] / a[0], a[5] / a[0])
         for nid, a in acc.items()
@@ -796,6 +799,10 @@ def _bench_report(result_runs: list[list[RunResult]], run: float, cores: int, wa
     floor, floor_id = max(((x[2], x[0]) for x in recs), default=(0.0, ""))
     ideal = sum_total / cores if cores else 0.0
     best = max(ideal, floor)
+    means = sorted(x[2] for x in recs)
+
+    def _pct(q: float) -> float:
+        return means[min(len(means) - 1, round(q * (len(means) - 1)))] if means else 0.0
 
     avg_note = f"avg of {n_runs} run{'s' if n_runs != 1 else ''}" + (" + warmup dropped" if warmup_dropped else "")
     out = [
@@ -808,6 +815,9 @@ def _bench_report(result_runs: list[list[RunResult]], run: float, cores: int, wa
         out.append(
             f"  where time goes: setup {sum_setup / sum_total:.0%} · call {sum_call / sum_total:.0%} · "
             f"teardown {sum_teardown / sum_total:.0%}   (of {sum_total:.0f}s test-wall)"
+        )
+        out.append(
+            f"  per-test wall : p50 {_pct(0.5):.3f}s · p90 {_pct(0.9):.3f}s · p99 {_pct(0.99):.3f}s · max {floor:.2f}s"
         )
 
     levers: list[tuple[float, str, list[str]]] = []
@@ -877,6 +887,24 @@ def _bench_report(result_runs: list[list[RunResult]], run: float, cores: int, wa
             out.extend(f"      {ln}" for ln in body)
     else:
         out.append("  no levers above the reporting threshold — the suite is already lean.")
+
+    # Unstable timing — needs ≥2 measured runs (so --bench=3+). cv = stdev/mean per test; a high cv
+    # is a measured fact (flaky perf / ordering-sensitive / contended), not a heuristic. Ranked by
+    # cv·mean (the wall actually at stake), only for tests big enough to matter.
+    unstable: list[tuple[float, str, float, float]] = []
+    for nid, xs in samples.items():
+        if len(xs) >= 2:
+            m = sum(xs) / len(xs)
+            if m >= _BENCH_LEVER_MIN_S:
+                sd = math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+                if m and sd / m >= _BENCH_CV:
+                    unstable.append((sd / m, nid, m, sd))
+    if unstable:
+        unstable.sort(key=lambda u: u[0] * u[2], reverse=True)
+        out.append(f"  ── unstable timing (cv ≥ {_BENCH_CV:.0%} across {n_runs} runs) ──────────────────────")
+        out.extend(f"      {nid}  {m:.2f}s ±{sd:.2f}s  (cv {cv:.0%})" for cv, nid, m, sd in unstable[:8])
+    elif n_runs < 2:
+        out.append("  (timing-stability needs ≥2 measured runs — try --bench=3+)")
     out.append(line)
     return "\n".join(out)
 

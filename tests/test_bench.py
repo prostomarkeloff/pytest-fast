@@ -54,3 +54,20 @@ def test_bench_averages_across_runs_and_drops_to_zero_safely() -> None:
     # empty input must not divide by zero
     assert "pytest-fast bench" in _bench_report([[]], run=0.0, cores=4)
     assert "pytest-fast bench" in _bench_report([], run=0.0, cores=4)
+
+
+def test_bench_flags_unstable_timing_with_multiple_runs() -> None:
+    # a steady test (1.0s every run) and a wildly unstable one (0.5/3.5/0.6 → cv high).
+    runs = [
+        [_r("t::steady", cpu=0.1, call=1.0), _r("t::jumpy", cpu=0.1, call=0.5)],
+        [_r("t::steady", cpu=0.1, call=1.0), _r("t::jumpy", cpu=0.1, call=3.5)],
+        [_r("t::steady", cpu=0.1, call=1.0), _r("t::jumpy", cpu=0.1, call=0.6)],
+    ]
+    blob = _bench_report(runs, run=2.0, cores=2)
+    assert "unstable timing" in blob
+    assert "t::jumpy" in blob
+    assert "t::steady" not in blob.split("unstable timing")[1]  # the steady one is NOT flagged
+    # with a single run, no variance data — point the user at more runs.
+    one = _bench_report([[_r("t::steady", cpu=0.1, call=1.0)]], run=2.0, cores=2)
+    assert "needs ≥2 measured runs" in one
+    assert "p50" in one  # percentiles always present
