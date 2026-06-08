@@ -66,6 +66,35 @@ def test_local_run_all_green_when_no_failures(tmp_path: Path, pf_cmd: list[str])
     assert "FAILURES" not in proc.stdout
 
 
+def test_detailed_flag_toggles_parallelism_block(tmp_path: Path, pf_cmd: list[str]) -> None:
+    """`--detailed` adds the extended parallelism block (eff / CPU vs I/O / lost / floor); a plain
+    run stays lean. Drives the real CLI → daemon-rendered summary path end to end."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_green.py").write_text(
+        "def test_a() -> None: assert True\ndef test_b() -> None: assert True\n",
+    )
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "tmp"\nversion = "0"\n')
+
+    def run(*extra: str) -> str:
+        proc = subprocess.run(
+            [*pf_cmd, "--workers", "2", "--runs", "1", *extra],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        assert proc.returncode == 0, f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
+        return proc.stdout
+
+    lean = run()
+    assert "detail —" not in lean and "I/O" not in lean, f"lean run leaked the detailed block:\n{lean}"
+
+    detailed = run("--detailed")
+    for token in ("detail —", "eff", "cpu", "lost", "floor"):
+        assert token in detailed, f"--detailed missing {token!r}:\n{detailed}"
+
+
 def test_local_run_dump_writes_outcome_json(tmp_project: Path, pf_cmd: list[str]) -> None:
     """`--dump PATH` must write `{nodeid: outcome}` JSON — that's the reference for
     outcome-diff against xdist."""

@@ -55,6 +55,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import pickle
 import selectors
@@ -111,12 +112,181 @@ class RunResult(TypedDict):
 
 
 class WorkerStats(TypedDict):
-    """Worker summary emitted at the end of a run (drives the par. metric in summary)."""
+    """Worker summary emitted at the end of a run (drives the par. metric + `--detailed` block).
+
+    `busy` is the WALL time spent inside the runtest protocol; `cpu` is this worker process's
+    CPU time over the same span (busy − cpu ≈ time blocked on I/O, e.g. a DB round-trip — that's
+    what makes par look full while cores idle). `bus_wait` is time the worker sat idle between
+    tests waiting for the master to hand out the next index. `run_wall` ≈ busy + bus_wait +
+    bookkeeping, so the rectangle N×run decomposes into Σbusy (useful) + Σbus_wait (bus overhead)
+    + Σ(run−run_wall) (tail/straggler drain)."""
 
     wid: int
     ran: int
     busy: float
+    cpu: float
+    bus_wait: float
     run_wall: float
+
+
+class ParMetrics(TypedDict):
+    """Derived parallelism metrics behind the `--detailed` block. Ratios are in '×' units
+    (worker-equivalents): a worker-seconds quantity divided by the run wall. See `WorkerStats`
+    for the N×run decomposition these come from."""
+
+    par: float  # Σbusy / run — effective parallel speedup (≤ num_workers)
+    eff: float  # par / num_workers — parallel efficiency in 0..1
+    cpu_par: float  # Σcpu / run — cores' worth of CPU actually burned
+    cpu_sat: float  # Σcpu / Σbusy — fraction of test-wall spent on-CPU (low → I/O-bound)
+    bus_lost: float  # Σbus_wait / run — parallelism lost to inter-test bus round-trips
+    tail_lost: float  # num_workers − Σrun_wall/run — lost to end-of-run straggler drain
+    ideal_wall: float  # Σbusy / num_workers — best wall a work-conserving scheduler could reach
+    busy_s: float  # Σbusy — total test-execution worker-seconds (serial-equivalent time)
+    cpu_s: float  # Σcpu — total CPU-seconds
+    bus_wait_s: float  # Σbus_wait — worker-seconds idle on the bus between tests
+    drain_s: float  # N·run − Σrun_wall — worker-seconds idle while stragglers finish
+    idle_cores: float  # num_workers − cpu_par — core-equivalents NOT computing (I/O wait + idle)
+    io_cores: float  # par − cpu_par — workers in a test but blocked on I/O (not on CPU)
+    run_wall_min: float
+    run_wall_max: float
+    wall_spread: float  # (run_wall_max − run_wall_min) / run — load imbalance, 0 = perfect
+    ran_min: int
+    ran_max: int
+    ran_ratio: float  # ran_max / ran_min — test-COUNT spread (high + low wall_spread = healthy)
+    floor: float  # longest single test — a hard lower bound on wall at ANY worker count
+    floor_nodeid: str
+    n_slow: int  # tests ≥ 1s — the heavy tail
+    p99: float  # 99th-percentile single-test duration
+
+
+def _parallelism_metrics(
+    worker_stats: list[WorkerStats], run: float, num_workers: int, results: list[RunResult]
+) -> ParMetrics:
+    """Pure aggregation of worker stats → the `--detailed` parallelism metrics. Kept separate from
+    rendering so it's unit-testable without a live daemon. Every division is guarded (run / Σbusy /
+    num_workers / ran_min can be 0 on an empty or instant run)."""
+    sum_busy = sum(s["busy"] for s in worker_stats)
+    sum_cpu = sum(s["cpu"] for s in worker_stats)
+    sum_bus = sum(s["bus_wait"] for s in worker_stats)
+    sum_run_wall = sum(s["run_wall"] for s in worker_stats)
+    rans = [s["ran"] for s in worker_stats]
+    run_walls = [s["run_wall"] for s in worker_stats]
+    durs = sorted(r["duration"] for r in results)
+    floor, floor_nodeid = max(((r["duration"], r["nodeid"]) for r in results), default=(0.0, ""))
+    par = sum_busy / run if run else 0.0
+    cpu_par = sum_cpu / run if run else 0.0
+    ran_min, ran_max = (min(rans), max(rans)) if rans else (0, 0)
+    rw_min, rw_max = (min(run_walls), max(run_walls)) if run_walls else (0.0, 0.0)
+    p99 = durs[min(len(durs) - 1, round(0.99 * (len(durs) - 1)))] if durs else 0.0
+    return {
+        "par": par,
+        "eff": (par / num_workers) if num_workers else 0.0,
+        "cpu_par": cpu_par,
+        "cpu_sat": sum_cpu / sum_busy if sum_busy else 0.0,
+        "bus_lost": sum_bus / run if run else 0.0,
+        "tail_lost": max(0.0, num_workers - sum_run_wall / run) if run else 0.0,
+        "ideal_wall": sum_busy / num_workers if num_workers else 0.0,
+        "busy_s": sum_busy,
+        "cpu_s": sum_cpu,
+        "bus_wait_s": sum_bus,
+        "drain_s": max(0.0, num_workers * run - sum_run_wall),
+        "idle_cores": max(0.0, num_workers - cpu_par),
+        "io_cores": max(0.0, par - cpu_par),
+        "run_wall_min": rw_min,
+        "run_wall_max": rw_max,
+        "wall_spread": (rw_max - rw_min) / run if run else 0.0,
+        "ran_min": ran_min,
+        "ran_max": ran_max,
+        "ran_ratio": ran_max / ran_min if ran_min else 1.0,
+        "floor": floor,
+        "floor_nodeid": floor_nodeid,
+        "n_slow": sum(1 for d in durs if d >= 1.0),
+        "p99": p99,
+    }
+
+
+def _suggest_workers(cpu_sat: float, cores: int, logical: int) -> int:
+    """Deterministic pool size (NOT a heuristic): if each worker is CPU-busy only `cpu_sat` of its
+    wall (the rest blocked on I/O), keeping `cores` cores saturated needs ≈`cores / cpu_sat` workers —
+    so that at any instant ~`cores` are in their CPU phase while the others overlap I/O (Little's-law
+    pool sizing).
+
+    But the cap is NOT the raw logical-core count. On big.LITTLE the workers past `cores` (the perf
+    cores) land on slower E-cores: empirically they add CPU-seconds (the work runs at ~half speed)
+    and only pay off by hiding the I/O-WAIT fraction `(1 − cpu_sat)`, not by adding CPU throughput.
+    So the ceiling is `cores + (logical − cores)·(1 − cpu_sat)` — the E-cores discounted by how
+    I/O-bound the suite is. A CPU-bound suite (cpu_sat→1) caps at `cores`; an I/O-bound one
+    (cpu_sat→0) can reach toward `logical`. On a uniform machine `cores == logical`, so it collapses
+    to a plain `cores` cap (no oversubscription suggestion — the right answer there too).
+    Verified on PRM2: raw `cores/cpu_sat` said 10 and 10w REGRESSED on per-db (E-core tax); the
+    discounted cap lands at ~8."""
+    if cpu_sat <= 0:
+        return cores
+    pool = math.ceil(cores / cpu_sat)  # ideal if extra workers had free, full-speed cores
+    e_core_cap = cores + (logical - cores) * (1.0 - cpu_sat)  # discount E-cores by the I/O fraction
+    return max(cores, min(pool, round(e_core_cap)))
+
+
+def _par_verdict(m: ParMetrics, num_workers: int, cores: int, logical: int) -> str:
+    """One-line synthesis → what to actually do. DESCRIPTIVE, not over-claiming: the worker-count
+    suggestion is a deterministic formula (`_suggest_workers`), shown ONLY in the clean regime
+    (`num_workers ≤ cores`, where cpu_sat isn't depressed by oversubscription) and always with the
+    shared-resource caveat (the I/O overlap only pays off if the resource scales). Priority: a
+    straggler tail is the loudest problem; then overhead; then the CPU-vs-I/O ceiling."""
+    if m["wall_spread"] > 0.15 and m["floor_nodeid"]:
+        return (
+            f"straggler — walls spread {m['wall_spread']:.0%}; tail likely "
+            f"{m['floor_nodeid']} ({m['floor']:.1f}s). Split/redistribute it."
+        )
+    if m["eff"] < 0.90:
+        return "low efficiency — bus chatter (tests too short?) or oversubscribed past useful work."
+    cpu_sat = m["cpu_sat"]
+    if cpu_sat >= 0.85:
+        return f"CPU-saturated ({cpu_sat:.0%} on-CPU) — bound by {cores} cores; more workers won't help."
+    if num_workers > cores:
+        # Already above perf cores → cpu_sat is contention-depressed; don't trust it for a number.
+        return (
+            f"running {num_workers}w above {cores} perf cores — CPU can't speed past {cores}; "
+            f"extra workers only overlap I/O (watch contention / E-core stragglers)."
+        )
+    w_opt = _suggest_workers(cpu_sat, cores, logical)
+    if w_opt > num_workers:
+        return (
+            f"{cpu_sat:.0%} CPU/test → your {cores} cores sit ~{1 - cpu_sat:.0%} idle on I/O; "
+            f"≈{w_opt} workers may overlap that (pool size cores÷CPU-frac, E-cores past {cores} "
+            f"discounted by the I/O fraction). Try --workers {w_opt} — measure: a shared DB or the "
+            f"E-core tax can still cancel the gain."
+        )
+    return f"near-optimal at {num_workers}w — wall ≈ work/cores, little headroom."
+
+
+def _detailed_par_lines(m: ParMetrics, run: float, num_workers: int, cores: int, logical: int) -> list[str]:
+    """Render the `--detailed` parallelism block. Beyond the raw ratios it surfaces: absolute
+    idle-seconds (not just '×'), idle core-equivalents (I/O-wait headroom — a FACT; the verdict
+    decides what it means), a balance read (count-spread is healthy when wall-spread is tiny —
+    work-stealing balances by TIME), the duration tail (floor is only the max), and a verdict with
+    a deterministic worker-count suggestion. `cores` = perf cores, `logical` = the hard cap."""
+    if m["cpu_sat"] >= 0.75:
+        bound = "compute-bound"
+    elif m["cpu_sat"] <= 0.40:
+        bound = "I/O-bound"
+    else:
+        bound = "mixed"
+    if m["wall_spread"] <= 0.10:
+        balance = f"by time — counts vary {m['ran_ratio']:.1f}x, walls within {m['wall_spread']:.0%} (healthy)"
+    else:
+        balance = f"UNEVEN — walls spread {m['wall_spread']:.0%} (straggler — see verdict)"
+    return [
+        "  detail —",
+        f"    eff     : {m['eff']:.0%}   (ideal wall {m['ideal_wall']:.2f}s vs {run:.2f}s actual)",
+        f"    cpu     : {m['cpu_par']:.2f}x of {num_workers}  ·  {m['cpu_sat']:.0%} CPU / {1 - m['cpu_sat']:.0%} I/O "
+        f"({bound})  ·  ~{m['idle_cores']:.1f} cores idle ({m['io_cores']:.1f} on I/O)",
+        f"    lost    : {m['bus_wait_s'] + m['drain_s']:.2f} worker-s idle  =  "
+        f"bus {m['bus_wait_s']:.2f}s + tail {m['drain_s']:.2f}s",
+        f"    balance : {balance}  (ran {m['ran_min']}–{m['ran_max']}/w)",
+        f"    floor   : {m['floor']:.2f}s  {m['floor_nodeid']}  ·  {m['n_slow']} tests ≥1s, p99 {m['p99']:.2f}s",
+        f"    verdict : {_par_verdict(m, num_workers, cores, logical)}",
+    ]
 
 
 # ── logging helper ───────────────────────────────────────────────────────────
@@ -617,13 +787,17 @@ def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodei
             faulthandler.enable()
 
     run_start = time.perf_counter()
-    busy = 0.0
+    busy = 0.0  # wall inside the runtest protocol
+    cpu = 0.0  # this worker's CPU time over that same span (busy − cpu ≈ I/O wait)
+    bus_wait = 0.0  # idle between tests, waiting for the master to hand out the next index
     ran = 0
     prev: Item | None = None
     pending: RunResult | None = None
     while True:
+        t_bus = time.perf_counter()
         _send(sock, ("req", wid, pending))
         reply, _ = _recv(sock)
+        bus_wait += time.perf_counter() - t_bus  # send result + wait for next idx = non-busy gap
         # Master gone / malformed reply → break out and exit cleanly (os._exit below). The
         # master sees EOF and the run is flagged untrusted via the result undercount.
         if not isinstance(reply, tuple) or len(reply) < 2:
@@ -633,6 +807,7 @@ def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodei
         cur = items[idx] if isinstance(idx, int) and 0 <= idx < len(items) else None
         if prev is not None:
             t0 = time.perf_counter()
+            c0 = time.process_time()
             if faulthandler_mod is not None:
                 faulthandler_mod.dump_traceback_later(hang_timeout, repeat=True, exit=False)
             try:
@@ -653,11 +828,19 @@ def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodei
             if faulthandler_mod is not None:
                 faulthandler_mod.cancel_dump_traceback_later()
             busy += time.perf_counter() - t0
+            cpu += time.process_time() - c0
             ran += 1
         else:
             pending = None
         if cur is None:
-            stats: WorkerStats = {"wid": wid, "ran": ran, "busy": busy, "run_wall": time.perf_counter() - run_start}
+            stats: WorkerStats = {
+                "wid": wid,
+                "ran": ran,
+                "busy": busy,
+                "cpu": cpu,
+                "bus_wait": bus_wait,
+                "run_wall": time.perf_counter() - run_start,
+            }
             _send(sock, ("fin", wid, pending, stats))
             break
         prev = cur
@@ -737,11 +920,11 @@ class Daemon:
 
     # ── public modes ─────────────────────────────────────────────────────────
 
-    def run(self, runs: int, *, full_report: bool = False) -> int:
+    def run(self, runs: int, *, full_report: bool = False, detailed: bool = False) -> int:
         """Local mode: single-shot (runs=1) or N runs in one process."""
         rc = 0
         for _ in range(runs):
-            rc, summary = self._run_once(full_report=full_report)
+            rc, summary = self._run_once(full_report=full_report, detailed=detailed)
             print(summary)
         return rc
 
@@ -847,7 +1030,7 @@ class Daemon:
                         # {stale} and EXIT — i.e. any stray frame could shut the resident daemon
                         # down (a same-user DoS). Real clients always send the verb "run".
                         continue
-                    # run request: ('run', fp[, full_report[, stream[, nodeids]]])
+                    # run request: ('run', fp[, full_report[, stream[, nodeids[, detailed]]]])
                     reason = _stale_reason(boot_mtime, boot_fp, client_fp)
                     if reason is not None:
                         _log("daemon", f"{reason} — exiting stale")
@@ -862,6 +1045,9 @@ class Daemon:
                     selection = (
                         cast("list[str]", fp_args[3]) if len(fp_args) > 3 and isinstance(fp_args[3], list) else None
                     )
+                    # `detailed` (CLI `--detailed`) adds the extended parallelism block to the
+                    # bespoke summary; irrelevant in stream mode (the plugin renders natively).
+                    detailed = len(fp_args) > 4 and bool(fp_args[4])
                     if stream:
                         # Controller renders natively from the streamed reports → no daemon-side
                         # progress frames (progress_conn=None), full reports required.
@@ -870,7 +1056,7 @@ class Daemon:
                         # progress_conn=conn: workers write dots into the DAEMON log, not the
                         # client's terminal — so we stream progress over this same socket
                         # (otherwise the client sits silent the whole run and looks frozen).
-                        rc, summary = self._run_once(progress_conn=conn, full_report=full_report)
+                        rc, summary = self._run_once(progress_conn=conn, full_report=full_report, detailed=detailed)
                     try:
                         _send(conn, {"rc": rc, "summary": summary})
                     except OSError:
@@ -891,6 +1077,7 @@ class Daemon:
         full_report: bool = False,
         report_conn: socket.socket | None = None,
         selection: list[str] | None = None,
+        detailed: bool = False,
     ) -> tuple[int, str]:
         idx = self._run_counter
         self._run_counter += 1
@@ -950,6 +1137,7 @@ class Daemon:
             run=t_done - t_ready,
             label=label,
             full_report=full_report,
+            detailed=detailed,
         )
         rc = 1 if any(r["outcome"] in {"failed", "error"} for r in results) else 0
         # Run integrity: a worker may have died BEFORE sending results (import/assert in
@@ -1113,6 +1301,7 @@ class Daemon:
         run: float,
         label: str,
         full_report: bool = False,
+        detailed: bool = False,
     ) -> str:
         from collections import Counter
 
@@ -1131,8 +1320,15 @@ class Daemon:
             f"  RUN     : {run:6.2f}s   ← wall",
             f"  par.    : {(sum_busy / run if run else 0):.2f}x of {self.num_workers}"
             f"   (run-wall max={max(run_walls) if run_walls else 0:.2f} min={min(run_walls) if run_walls else 0:.2f})",
-            f"  bus     : {int(bus['req_count'])} round-trips, {bus['rx'] / 1024:.0f}KB rx",
         ]
+        if detailed:
+            metrics = _parallelism_metrics(worker_stats, run, self.num_workers, results)
+            # cores = perf-core count (the throughput baseline + the default worker count);
+            # logical = the hard cap for any worker-count suggestion.
+            cores = _default_workers()
+            logical = os.cpu_count() or cores
+            out.extend(_detailed_par_lines(metrics, run, self.num_workers, cores, logical))
+        out.append(f"  bus     : {int(bus['req_count'])} round-trips, {bus['rx'] / 1024:.0f}KB rx")
         if failed:
             out.append(f"  FAILURES ({failed}):")
             for r in results:
@@ -1163,7 +1359,7 @@ class Daemon:
 # ── client-side: request a run from the resident daemon ──────────────────────
 
 
-def request_run(address: str, *, full_report: bool = False) -> dict[str, object]:
+def request_run(address: str, *, full_report: bool = False, detailed: bool = False) -> dict[str, object]:
     """Trigger a run on the daemon; stream progress to stdout, return the final frame
     (`{rc, summary}` or `{stale: True}`). The daemon sends N `{'progress': (done,total)}`
     frames then one final frame — we recv in a loop until a non-progress frame arrives.
@@ -1178,7 +1374,9 @@ def request_run(address: str, *, full_report: bool = False) -> dict[str, object]
     with _short_unix_path(address) as connect_path:
         sock.connect(connect_path)
     with sock:
-        _send(sock, ("run", _env_fingerprint(), full_report))  # fp (stale-check) + report mode
+        # ('run', fp, full_report, stream, nodeids, detailed) — non-streamed CLI run, so stream=False
+        # and nodeids=None; `detailed` rides as the 6th element (a daemon predating it ignores it).
+        _send(sock, ("run", _env_fingerprint(), full_report, False, None, detailed))
         while True:
             raw, _ = _recv(sock)
             if not isinstance(raw, dict):
@@ -1664,7 +1862,14 @@ def _run_via_daemon(
 
 
 def _ensure_and_run(
-    workers: int, start_method: str, address: str, ttl: float, *, with_watcher: bool, full_report: bool = False
+    workers: int,
+    start_method: str,
+    address: str,
+    ttl: float,
+    *,
+    with_watcher: bool,
+    full_report: bool = False,
+    detailed: bool = False,
 ) -> int:
     """CLI client (front A): connect to the daemon → run → print the daemon-rendered summary."""
     reply = _run_via_daemon(
@@ -1673,7 +1878,7 @@ def _ensure_and_run(
         address,
         ttl,
         with_watcher=with_watcher,
-        run=lambda addr: request_run(addr, full_report=full_report),
+        run=lambda addr: request_run(addr, full_report=full_report, detailed=detailed),
     )
     summary = reply.get("summary")
     if summary is not None:
@@ -2107,6 +2312,12 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="ship full per-phase reports → a real --durations table in the summary (heavier bus)",
     )
+    parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="add the extended parallelism block to the summary (eff%%, CPU vs I/O, lost-time "
+        "breakdown, per-worker spread, the wall-bounding test)",
+    )
     ns = parser.parse_args(argv)
     try:
         workers = _resolve_workers(ns.workers)
@@ -2134,9 +2345,10 @@ def main(argv: list[str]) -> int:
             ttl,
             with_watcher=ns.with_watcher,
             full_report=ns.full_report,
+            detailed=ns.detailed,
         )
     return Daemon(num_workers=workers, start_method=ns.start_method, dump_path=ns.dump).run(
-        ns.runs, full_report=ns.full_report
+        ns.runs, full_report=ns.full_report, detailed=ns.detailed
     )
 
 
