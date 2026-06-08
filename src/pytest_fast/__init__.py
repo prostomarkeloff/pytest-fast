@@ -88,10 +88,12 @@ __all__ = [
     "RunResult",
     "WorkerStats",
     "categorize",
+    "default_workers",  # public worker-count API (auto-detect, ignores overrides)
     "main",
     "main_cli",
     "request_run",  # client-side, module-level
     "request_run_streamed",  # client-side streaming (used by the --fast plugin controller)
+    "resolve_workers",  # public worker-count API (full precedence; stable for external tooling)
 ]
 
 
@@ -701,7 +703,12 @@ def pytest_sessionfinish(session: object) -> None:
 class Daemon:
     def __init__(self, num_workers: int, start_method: str, dump_path: str | None = None) -> None:
         super().__init__()
-        assert num_workers >= 1, "num_workers must be >= 1"
+        # Real raise, not `assert` — this is a safety invariant (0 workers → nothing runs →
+        # silent green), and `assert` is stripped under `python -O`. Entry points reject `< 1`
+        # earlier with a friendlier message; this is the last-line guard for direct callers.
+        if num_workers < 1:
+            msg = f"num_workers must be >= 1, got {num_workers}"
+            raise ValueError(msg)
         self.num_workers = num_workers
         self.start_method = start_method
         self.dump_path = dump_path
@@ -1715,15 +1722,49 @@ def _default_workers() -> int:
 
 def _resolve_workers(cli_value: int | None) -> int:
     """Worker count precedence: explicit CLI/option value → `PYTEST_FAST_WORKERS` env →
-    performance-core auto-detect (`_default_workers`)."""
+    performance-core auto-detect (`_default_workers`).
+
+    The single chokepoint that guarantees a VALID (`>= 1`) count for every caller — the CLI,
+    the `--fast` plugin, and external tooling via the public `resolve_workers`. An explicit
+    `< 1` (a `--workers`/`--fast-workers` option or a *parseable* `PYTEST_FAST_WORKERS`) is a
+    user error and raises `ValueError`: 0 workers means no worker ever runs, so the suite
+    exits green having executed nothing — a silent false-pass a test runner must never produce.
+    Callers surface the error idiomatically (CLI → `parser.error`, plugin → `pytest.UsageError`).
+    An UNPARSEABLE env value (e.g. `garbage`) is treated as unset and falls back to auto-detect,
+    which always returns `>= 1` — so this function never returns a value below 1."""
     if cli_value is not None:
+        if cli_value < 1:
+            msg = f"worker count must be >= 1, got {cli_value}"
+            raise ValueError(msg)
         return cli_value
     env = os.environ.get("PYTEST_FAST_WORKERS")
     if env:
         try:
-            return int(env)
+            n = int(env)
         except ValueError:
-            pass
+            n = None  # unparseable → treat as unset, fall through to auto-detect
+        if n is not None:
+            if n < 1:
+                msg = f"PYTEST_FAST_WORKERS must be >= 1, got {n}"
+                raise ValueError(msg)
+            return n
+    return _default_workers()
+
+
+def resolve_workers(cli_value: int | None = None) -> int:
+    """The worker count pytest-fast will use, by the documented precedence: an explicit
+    `cli_value` → `PYTEST_FAST_WORKERS` → performance-core auto-detect. Stable public API for
+    external tooling that needs to size a per-worker resource pool to match the run (prefer this
+    over the private `_resolve_workers`; behavior is identical). Raises `ValueError` on an
+    explicit `< 1` value; an unparseable env var falls back to auto-detect. See also the
+    `pytest-fast --print-inferred-workers` CLI, which prints exactly `resolve_workers()`."""
+    return _resolve_workers(cli_value)
+
+
+def default_workers() -> int:
+    """The auto-detected default worker count — performance cores on Apple Silicon, logical CPUs
+    elsewhere — ignoring any `--workers` / `PYTEST_FAST_WORKERS` override. Public; always `>= 1`.
+    Use `resolve_workers` instead when overrides should win."""
     return _default_workers()
 
 
@@ -1805,7 +1846,15 @@ def pytest_runtestloop(session: Session) -> bool | None:
         raise session.Interrupted(f"{session.testsfailed} error(s) during collection")
 
     address = _resolve_fast_address(cast("str | None", config.getoption("fast_address")))
-    workers = _resolve_workers(cast("int | None", config.getoption("fast_workers")))
+    try:
+        workers = _resolve_workers(cast("int | None", config.getoption("fast_workers")))
+    except ValueError as exc:
+        # An invalid --fast-workers / PYTEST_FAST_WORKERS must fail this session cleanly, NOT
+        # spawn a daemon with 0 workers (which would run nothing and exit green). UsageError is
+        # pytest's idiom for a bad invocation — same as the collection-match guard below.
+        import pytest
+
+        raise pytest.UsageError(f"--fast: {exc}") from exc
     ttl = _resolve_ttl(cast("float | None", config.getoption("fast_ttl")))
     with_watcher = bool(config.getoption("fast_watch"))
 
@@ -2030,6 +2079,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--workers", type=int, default=None, help="worker count (or $PYTEST_FAST_WORKERS; default: performance cores)"
     )
+    parser.add_argument(
+        "--print-inferred-workers",
+        action="store_true",
+        help="print the resolved worker count (honoring --workers / $PYTEST_FAST_WORKERS / "
+        "performance-core auto-detect) and exit — so external tooling can size a per-worker "
+        "pool to match the run without importing pytest-fast internals",
+    )
     parser.add_argument("--start-method", choices=["spawn", "forkserver", "fork"], default="forkserver")
     parser.add_argument("--address", help="unix socket of the resident daemon (or $PYTEST_FAST_ADDRESS)")
     parser.add_argument(
@@ -2052,11 +2108,15 @@ def main(argv: list[str]) -> int:
         help="ship full per-phase reports → a real --durations table in the summary (heavier bus)",
     )
     ns = parser.parse_args(argv)
-    workers = _resolve_workers(ns.workers)
+    try:
+        workers = _resolve_workers(ns.workers)
+    except ValueError as exc:
+        parser.error(str(exc))  # exits 2 — never proceeds with an invalid count
+    if ns.print_inferred_workers:
+        print(workers)
+        return 0
     ttl = _resolve_ttl(ns.ttl)
     address = ns.address or os.environ.get("PYTEST_FAST_ADDRESS")
-    if workers < 1:
-        parser.error("--workers must be >= 1")
 
     if ns.watch:
         if not address:

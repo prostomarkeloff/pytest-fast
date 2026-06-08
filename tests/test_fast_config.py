@@ -20,12 +20,16 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pytest_fast import (
+    Daemon,
     _default_fast_address,
     _default_workers,
     _resolve_fast_address,
     _resolve_ttl,
     _resolve_workers,
     _status,
+    default_workers,
+    main,
+    resolve_workers,
 )
 
 if TYPE_CHECKING:
@@ -51,6 +55,68 @@ def test_resolve_workers_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _resolve_workers(2) == 2  # explicit still beats env
     monkeypatch.setenv("PYTEST_FAST_WORKERS", "garbage")
     assert _resolve_workers(None) == _default_workers()  # unparseable env → auto
+
+
+@pytest.mark.parametrize("bad", [0, -1, -8])
+def test_resolve_workers_rejects_explicit_below_one(bad: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit `< 1` count is a user error, not a silent 0-worker false-green: it raises so
+    every entry point can refuse the run. Covers both the option value and a parseable env var."""
+    monkeypatch.delenv("PYTEST_FAST_WORKERS", raising=False)
+    with pytest.raises(ValueError, match=">= 1"):
+        _resolve_workers(bad)
+    monkeypatch.setenv("PYTEST_FAST_WORKERS", str(bad))
+    with pytest.raises(ValueError, match="PYTEST_FAST_WORKERS"):
+        _resolve_workers(None)
+
+
+def test_resolve_workers_never_returns_below_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The post-condition the plugin/CLI rely on: a value that comes back is always runnable."""
+    for env in ("", "garbage", "3.5", "0x4"):  # empty + every unparseable form → auto-detect
+        monkeypatch.setenv("PYTEST_FAST_WORKERS", env)
+        assert _resolve_workers(None) >= 1
+
+
+def test_public_worker_api_matches_private(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`resolve_workers` / `default_workers` are the supported surface for external tooling —
+    thin, behavior-identical aliases of the internal helpers (so a Makefile need not import `_`)."""
+    monkeypatch.setenv("PYTEST_FAST_WORKERS", "4")
+    assert resolve_workers() == _resolve_workers(None) == 4
+    assert resolve_workers(2) == 2
+    assert default_workers() == _default_workers()
+    monkeypatch.setenv("PYTEST_FAST_WORKERS", "0")
+    with pytest.raises(ValueError, match=">= 1"):
+        resolve_workers()
+
+
+@pytest.mark.parametrize("bad", [0, -3])
+def test_daemon_rejects_zero_workers(bad: int) -> None:
+    """Last-line guard: a direct `Daemon(num_workers=0)` raises (a real check, not an `assert`
+    that `python -O` would strip), since 0 workers run nothing and exit green."""
+    with pytest.raises(ValueError, match=">= 1"):
+        Daemon(num_workers=bad, start_method="forkserver")
+
+
+def test_print_inferred_workers_prints_and_exits(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`pytest-fast --print-inferred-workers` prints the resolved count and exits 0 — the public
+    way to size a per-worker pool to the run without importing internals or replicating detection."""
+    monkeypatch.setenv("PYTEST_FAST_WORKERS", "7")
+    rc = main(["--print-inferred-workers"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "7"
+    # honors an explicit option over the env, too
+    rc = main(["--print-inferred-workers", "--workers", "3"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "3"
+
+
+def test_cli_rejects_invalid_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI surfaces an invalid count as a clean argparse error (exit 2), never a 0-worker run."""
+    monkeypatch.delenv("PYTEST_FAST_WORKERS", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        main(["--workers", "0", "--runs", "1"])
+    assert exc.value.code == 2
 
 
 def test_resolve_ttl_precedence(monkeypatch: pytest.MonkeyPatch) -> None:

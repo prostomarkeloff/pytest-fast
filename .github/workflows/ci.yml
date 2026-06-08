@@ -110,9 +110,14 @@ jobs:
       - name: Install Atheris
         run: uv pip install atheris
       - name: Fuzz the wire decoder (300s)
+        # `--no-sync`: the venv was synced on 3.13 above and atheris was `uv pip install`ed
+        # into it ad-hoc (it's not a locked dep — targets py3.11–3.13, build-from-source on
+        # macOS). A bare `uv run` re-reconciles against `.python-version` (3.11), tears the
+        # 3.13 venv down, rebuilds it, and drops atheris → ModuleNotFoundError. `--no-sync`
+        # runs against the existing venv untouched.
         run: |
           mkdir -p fuzz/corpus-work
-          uv run python fuzz/fuzz_wire.py -max_total_time=300 -rss_limit_mb=2048 fuzz/corpus-work fuzz/corpus
+          uv run --no-sync python fuzz/fuzz_wire.py -max_total_time=300 -rss_limit_mb=2048 fuzz/corpus-work fuzz/corpus
       - name: Upload crashers
         if: failure()
         uses: actions/upload-artifact@v4

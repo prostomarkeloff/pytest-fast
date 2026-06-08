@@ -112,6 +112,8 @@ That's **real pytest output**, not a re-implementation. How: your `pytest` proce
 
 The default worker count is the number of **performance cores**, not the logical CPU count. On Apple Silicon (and other big.LITTLE designs) cores split into performance (P) and efficiency (E) cores; E-cores run ~half the throughput. The work-stealing dispatcher finishes when the **slowest** worker drains, so a worker scheduled onto an E-core becomes a straggler that bounds the whole run — more workers than P-cores doesn't speed things up, it adds stragglers plus memory/scheduler contention. So pytest-fast pins to the P-core count (macOS: `hw.perflevel0.physicalcpu`; e.g. 6 on a 6P+6E machine), falling back to the logical CPU count elsewhere. Override with `--fast-workers` / `--workers` / `PYTEST_FAST_WORKERS`.
 
+**Need the resolved count in a script** (e.g. a Makefile sizing a per-worker resource pool to match the run)? Don't replicate the detection — ask the tool. `pytest-fast --print-inferred-workers` prints the count it would use (honoring the override precedence) and exits; the same value is available programmatically as `pytest_fast.resolve_workers()` (and `default_workers()` for the override-ignoring auto-detect). An invalid count (`--workers 0`, `PYTEST_FAST_WORKERS=-1`) is rejected loudly on every front-end — a 0-worker run would execute nothing and exit green, a false pass a test runner must never produce.
+
 ---
 
 ## `pytest-fast` — the CLI runner (lean & fast)
@@ -297,6 +299,9 @@ pytest --fast                # or: pytest-fast --address /tmp/myapp.sock --worke
 --start-method M     spawn / forkserver / fork (default forkserver)
 --full-report        Ship full per-phase reports → a real --durations table in the summary
 --with-watcher       Spawn a pre-warm watcher alongside the daemon
+--print-inferred-workers  Print the resolved worker count and exit (honors --workers /
+                     $PYTEST_FAST_WORKERS / perf-core auto-detect) — for external tooling
+                     sizing a per-worker pool to the run, without importing internals
 --runs N             Local single-process mode (no daemon)
 --dump PATH          Local mode: write {nodeid: outcome} JSON
 --serve / --watch    Internal (the daemon / watcher processes spawn themselves with these)
