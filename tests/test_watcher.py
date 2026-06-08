@@ -37,6 +37,27 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
+@pytest.fixture(autouse=True)
+def _fast_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the watcher poll/debounce to ~0.05s for the whole module — the watcher subprocesses
+    (and the staging daemons they spawn) inherit this env, so these end-to-end tests promote in
+    ~0.3s instead of ~2.7s. Autouse + function scope → set before the `alive_daemon` fixture spawns,
+    so the daemon also boots with it."""
+    monkeypatch.setenv("PYTEST_FAST_WATCH_POLL", "0.05")
+    monkeypatch.setenv("PYTEST_FAST_WATCH_DEBOUNCE", "0.05")
+
+
+def _wait_for_log(path: Path, substr: str, timeout: float = 15.0) -> bool:
+    """Poll a log file until it contains `substr` (or timeout) — replaces fixed sleeps with a wait
+    on the actual event, so the test returns the instant the watcher reaches the expected state."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists() and substr in path.read_text():
+            return True
+        time.sleep(0.03)
+    return False
+
+
 def _spawn_daemon_proc(
     pf_cmd: list[str],
     *,
@@ -99,7 +120,7 @@ def _wait_for_new_pid(address: str, original_pid: int, timeout: float) -> int | 
         pid = _read_pid(address)
         if pid is not None and pid != original_pid:
             return pid
-        time.sleep(0.2)
+        time.sleep(0.03)
     return None
 
 
@@ -122,28 +143,14 @@ def test_watcher_single_instance_via_flock(
 ) -> None:
     """A second `_spawn_watcher` must immediately see the foreign lock and exit
     quietly. The second watcher's log must contain «already holds the lock — exiting»."""
-    _spawn_watcher(
-        workers=2,
-        start_method="forkserver",
-        address=tmp_address,
-        ttl=10.0,
-        cwd=str(tmp_project),
-    )
-    time.sleep(1.5)  # let the first watcher take the lock and enter its poll loop
-
-    _spawn_watcher(
-        workers=2,
-        start_method="forkserver",
-        address=tmp_address,
-        ttl=10.0,
-        cwd=str(tmp_project),
-    )
-    time.sleep(1.0)  # the second should bail out almost instantly
-
     log = Path(tmp_address.removesuffix(".sock") + "-watcher.log")
-    assert log.exists(), "watcher log was not created"
-    text = log.read_text()
-    assert "already holds the lock" in text, f"second watcher should have exited on flock conflict. log:\n{text}"
+    _spawn_watcher(workers=2, start_method="forkserver", address=tmp_address, ttl=10.0, cwd=str(tmp_project))
+    assert _wait_for_log(log, "pre-warming"), "first watcher never entered its poll loop"
+
+    _spawn_watcher(workers=2, start_method="forkserver", address=tmp_address, ttl=10.0, cwd=str(tmp_project))
+    assert _wait_for_log(log, "already holds the lock"), (
+        f"second watcher should have exited on flock conflict. log:\n{log.read_text() if log.exists() else '<none>'}"
+    )
 
 
 def test_watcher_promotes_on_source_change(
@@ -155,28 +162,22 @@ def test_watcher_promotes_on_source_change(
     original_pid = _read_pid(tmp_address)
     assert original_pid is not None, "daemon pidfile must exist"
 
-    _spawn_watcher(
-        workers=2,
-        start_method="forkserver",
-        address=tmp_address,
-        ttl=15.0,
-        cwd=str(tmp_project),
-    )
-    time.sleep(1.5)  # let the watcher enter its poll loop and capture the baseline mtime
+    watcher_log = Path(tmp_address.removesuffix(".sock") + "-watcher.log")
+    _spawn_watcher(workers=2, start_method="forkserver", address=tmp_address, ttl=15.0, cwd=str(tmp_project))
+    assert _wait_for_log(watcher_log, "pre-warming"), "watcher never entered its poll loop"
 
     # Shift mtime forward — wake the watcher
     target = tmp_project / "src" / "foo.py"
     future = target.stat().st_mtime + 10.0
     os.utime(target, (future, future))
 
-    # Watcher: poll 0.5s + debounce 0.7s + staging boot ~1-3s + canonical shutdown
-    # + socket-gone wait + promote. Realistically ~5s; we give 30s of headroom.
+    # Watcher: poll + debounce (tiny under _fast_watch) + staging boot + canonical shutdown +
+    # socket-gone wait + promote. ~0.5s here; 30s of headroom for a loaded CI runner.
     new_pid = _wait_for_new_pid(tmp_address, original_pid, timeout=30.0)
     if new_pid is None:
         pytest.fail(f"watcher didn't promote.\n{_dump_diag(tmp_address)}")
     assert new_pid != original_pid
 
-    watcher_log = Path(tmp_address.removesuffix(".sock") + "-watcher.log")
     text = watcher_log.read_text()
     assert "source change settled" in text
     assert "promoted fresh warm daemon" in text, f"missing 'promoted' line. log:\n{text}"
@@ -203,32 +204,18 @@ def test_watcher_skips_promote_on_broken_collect(
     original_pid = _read_pid(tmp_address)
     assert original_pid is not None
 
-    _spawn_watcher(
-        workers=2,
-        start_method="forkserver",
-        address=tmp_address,
-        ttl=15.0,
-        cwd=str(tmp_project),
-    )
-    time.sleep(1.5)
+    watcher_log = Path(tmp_address.removesuffix(".sock") + "-watcher.log")
+    _spawn_watcher(workers=2, start_method="forkserver", address=tmp_address, ttl=15.0, cwd=str(tmp_project))
+    assert _wait_for_log(watcher_log, "pre-warming"), "watcher never entered its poll loop"
 
     # Touch something so the watcher notices mtime change and tries to promote
     target = tmp_project / "src" / "foo.py"
     future = target.stat().st_mtime + 10.0
     os.utime(target, (future, future))
 
-    # Wait for «did not collect» in the watcher log (max staging boot timeout is 90s,
-    # but a broken-edit fails immediately via `proc.poll()` in `_await_ready` — really <5s).
-    watcher_log = Path(tmp_address.removesuffix(".sock") + "-watcher.log")
-    deadline = time.monotonic() + 30.0
-    saw_failure = False
-    while time.monotonic() < deadline:
-        if watcher_log.exists() and "did not collect" in watcher_log.read_text():
-            saw_failure = True
-            break
-        time.sleep(0.3)
-
-    if not saw_failure:
+    # Wait for «did not collect» (max staging boot timeout is 90s, but a broken edit fails
+    # immediately via `proc.poll()` in `_await_ready` — really <1s).
+    if not _wait_for_log(watcher_log, "did not collect", timeout=30.0):
         pytest.fail(f"watcher didn't log a failure for the broken conftest.\n{_dump_diag(tmp_address)}")
 
     # Canonical pid must not change (the old daemon stays alive, staging failed)

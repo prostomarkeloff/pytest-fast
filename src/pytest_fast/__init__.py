@@ -55,6 +55,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import pickle
 import selectors
@@ -67,9 +68,10 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
 if TYPE_CHECKING:
+    import cProfile
     from collections.abc import Callable, Iterator
     from multiprocessing.context import DefaultContext
 
@@ -103,6 +105,10 @@ class RunResult(TypedDict):
     nodeid: str
     outcome: str
     duration: float
+    cpu: NotRequired[float]  # per-test process CPU time (duration − cpu ≈ I/O wait); for `bench`
+    # cProfile rows (qualname, ncalls, tottime, cumtime) for the test, top-by-cumtime — only on the
+    # targeted profiling pass `bench` runs over its top bottleneck tests. Deterministic call counts.
+    profile: NotRequired[list[tuple[str, int, float, float]]]
     longrepr: NotRequired[str]  # failure text — only for failed/error
     # Every phase report in pytest's serializable wire form (plain builtins, whitelist-safe),
     # present only in full-report mode — lets the master/controller replay them through a real
@@ -111,12 +117,195 @@ class RunResult(TypedDict):
 
 
 class WorkerStats(TypedDict):
-    """Worker summary emitted at the end of a run (drives the par. metric in summary)."""
+    """Worker summary emitted at the end of a run (drives the par. metric + `--detailed` block).
+
+    `busy` is the WALL time spent inside the runtest protocol; `cpu` is this worker process's
+    CPU time over the same span (busy − cpu ≈ time blocked on I/O, e.g. a DB round-trip — that's
+    what makes par look full while cores idle). `bus_wait` is time the worker sat idle between
+    tests waiting for the master to hand out the next index. `run_wall` ≈ busy + bus_wait +
+    bookkeeping, so the rectangle N×run decomposes into Σbusy (useful) + Σbus_wait (bus overhead)
+    + Σ(run−run_wall) (tail/straggler drain)."""
 
     wid: int
     ran: int
     busy: float
+    cpu: float
+    bus_wait: float
     run_wall: float
+
+
+class _RunOutcome(NamedTuple):
+    """Raw output of one fork→serve→collect cycle (`Daemon._execute_run`), before rendering —
+    shared by the single-run summary path and the N-run `--bench` aggregation."""
+
+    results: list[RunResult]
+    worker_stats: list[WorkerStats]
+    bus: dict[str, float]
+    warmup: float  # fork+spawn time (t_ready − t0)
+    run_wall: float  # execution wall (t_done − t_ready)
+    total: int
+    idx: int
+    exitcodes: list[int | None]
+
+
+class ParMetrics(TypedDict):
+    """Derived parallelism metrics behind the `--detailed` block. Ratios are in '×' units
+    (worker-equivalents): a worker-seconds quantity divided by the run wall. See `WorkerStats`
+    for the N×run decomposition these come from."""
+
+    par: float  # Σbusy / run — effective parallel speedup (≤ num_workers)
+    eff: float  # par / num_workers — parallel efficiency in 0..1
+    cpu_par: float  # Σcpu / run — cores' worth of CPU actually burned
+    cpu_sat: float  # Σcpu / Σbusy — fraction of test-wall spent on-CPU (low → I/O-bound)
+    bus_lost: float  # Σbus_wait / run — parallelism lost to inter-test bus round-trips
+    tail_lost: float  # num_workers − Σrun_wall/run — lost to end-of-run straggler drain
+    ideal_wall: float  # Σbusy / num_workers — best wall a work-conserving scheduler could reach
+    busy_s: float  # Σbusy — total test-execution worker-seconds (serial-equivalent time)
+    cpu_s: float  # Σcpu — total CPU-seconds
+    bus_wait_s: float  # Σbus_wait — worker-seconds idle on the bus between tests
+    drain_s: float  # N·run − Σrun_wall — worker-seconds idle while stragglers finish
+    idle_cores: float  # num_workers − cpu_par — core-equivalents NOT computing (I/O wait + idle)
+    io_cores: float  # par − cpu_par — workers in a test but blocked on I/O (not on CPU)
+    run_wall_min: float
+    run_wall_max: float
+    wall_spread: float  # (run_wall_max − run_wall_min) / run — load imbalance, 0 = perfect
+    ran_min: int
+    ran_max: int
+    ran_ratio: float  # ran_max / ran_min — test-COUNT spread (high + low wall_spread = healthy)
+    floor: float  # longest single test — a hard lower bound on wall at ANY worker count
+    floor_nodeid: str
+    n_slow: int  # tests ≥ 1s — the heavy tail
+    p99: float  # 99th-percentile single-test duration
+
+
+def _parallelism_metrics(
+    worker_stats: list[WorkerStats], run: float, num_workers: int, results: list[RunResult]
+) -> ParMetrics:
+    """Pure aggregation of worker stats → the `--detailed` parallelism metrics. Kept separate from
+    rendering so it's unit-testable without a live daemon. Every division is guarded (run / Σbusy /
+    num_workers / ran_min can be 0 on an empty or instant run)."""
+    sum_busy = sum(s["busy"] for s in worker_stats)
+    sum_cpu = sum(s["cpu"] for s in worker_stats)
+    sum_bus = sum(s["bus_wait"] for s in worker_stats)
+    sum_run_wall = sum(s["run_wall"] for s in worker_stats)
+    rans = [s["ran"] for s in worker_stats]
+    run_walls = [s["run_wall"] for s in worker_stats]
+    durs = sorted(r["duration"] for r in results)
+    floor, floor_nodeid = max(((r["duration"], r["nodeid"]) for r in results), default=(0.0, ""))
+    par = sum_busy / run if run else 0.0
+    cpu_par = sum_cpu / run if run else 0.0
+    ran_min, ran_max = (min(rans), max(rans)) if rans else (0, 0)
+    rw_min, rw_max = (min(run_walls), max(run_walls)) if run_walls else (0.0, 0.0)
+    p99 = durs[min(len(durs) - 1, round(0.99 * (len(durs) - 1)))] if durs else 0.0
+    return {
+        "par": par,
+        "eff": (par / num_workers) if num_workers else 0.0,
+        "cpu_par": cpu_par,
+        "cpu_sat": sum_cpu / sum_busy if sum_busy else 0.0,
+        "bus_lost": sum_bus / run if run else 0.0,
+        "tail_lost": max(0.0, num_workers - sum_run_wall / run) if run else 0.0,
+        "ideal_wall": sum_busy / num_workers if num_workers else 0.0,
+        "busy_s": sum_busy,
+        "cpu_s": sum_cpu,
+        "bus_wait_s": sum_bus,
+        "drain_s": max(0.0, num_workers * run - sum_run_wall),
+        "idle_cores": max(0.0, num_workers - cpu_par),
+        "io_cores": max(0.0, par - cpu_par),
+        "run_wall_min": rw_min,
+        "run_wall_max": rw_max,
+        "wall_spread": (rw_max - rw_min) / run if run else 0.0,
+        "ran_min": ran_min,
+        "ran_max": ran_max,
+        "ran_ratio": ran_max / ran_min if ran_min else 1.0,
+        "floor": floor,
+        "floor_nodeid": floor_nodeid,
+        "n_slow": sum(1 for d in durs if d >= 1.0),
+        "p99": p99,
+    }
+
+
+def _suggest_workers(cpu_sat: float, cores: int, logical: int) -> int:
+    """Deterministic pool size (NOT a heuristic): if each worker is CPU-busy only `cpu_sat` of its
+    wall (the rest blocked on I/O), keeping `cores` cores saturated needs ≈`cores / cpu_sat` workers —
+    so that at any instant ~`cores` are in their CPU phase while the others overlap I/O (Little's-law
+    pool sizing).
+
+    But the cap is NOT the raw logical-core count. On big.LITTLE the workers past `cores` (the perf
+    cores) land on slower E-cores: empirically they add CPU-seconds (the work runs at ~half speed)
+    and only pay off by hiding the I/O-WAIT fraction `(1 − cpu_sat)`, not by adding CPU throughput.
+    So the ceiling is `cores + (logical − cores)·(1 − cpu_sat)` — the E-cores discounted by how
+    I/O-bound the suite is. A CPU-bound suite (cpu_sat→1) caps at `cores`; an I/O-bound one
+    (cpu_sat→0) can reach toward `logical`. On a uniform machine `cores == logical`, so it collapses
+    to a plain `cores` cap (no oversubscription suggestion — the right answer there too).
+    Verified on PRM2: raw `cores/cpu_sat` said 10 and 10w REGRESSED on per-db (E-core tax); the
+    discounted cap lands at ~8."""
+    if cpu_sat <= 0:
+        return cores
+    pool = math.ceil(cores / cpu_sat)  # ideal if extra workers had free, full-speed cores
+    e_core_cap = cores + (logical - cores) * (1.0 - cpu_sat)  # discount E-cores by the I/O fraction
+    return max(cores, min(pool, round(e_core_cap)))
+
+
+def _par_verdict(m: ParMetrics, num_workers: int, cores: int, logical: int) -> str:
+    """One-line synthesis → what to actually do. DESCRIPTIVE, not over-claiming: the worker-count
+    suggestion is a deterministic formula (`_suggest_workers`), shown ONLY in the clean regime
+    (`num_workers ≤ cores`, where cpu_sat isn't depressed by oversubscription) and always with the
+    shared-resource caveat (the I/O overlap only pays off if the resource scales). Priority: a
+    straggler tail is the loudest problem; then overhead; then the CPU-vs-I/O ceiling."""
+    if m["wall_spread"] > 0.15 and m["floor_nodeid"]:
+        return (
+            f"straggler — walls spread {m['wall_spread']:.0%}; tail likely "
+            f"{m['floor_nodeid']} ({m['floor']:.1f}s). Split/redistribute it."
+        )
+    if m["eff"] < 0.90:
+        return "low efficiency — bus chatter (tests too short?) or oversubscribed past useful work."
+    cpu_sat = m["cpu_sat"]
+    if cpu_sat >= 0.85:
+        return f"CPU-saturated ({cpu_sat:.0%} on-CPU) — bound by {cores} cores; more workers won't help."
+    if num_workers > cores:
+        # Already above perf cores → cpu_sat is contention-depressed; don't trust it for a number.
+        return (
+            f"running {num_workers}w above {cores} perf cores — CPU can't speed past {cores}; "
+            f"extra workers only overlap I/O (watch contention / E-core stragglers)."
+        )
+    w_opt = _suggest_workers(cpu_sat, cores, logical)
+    if w_opt > num_workers:
+        return (
+            f"{cpu_sat:.0%} CPU/test → your {cores} cores sit ~{1 - cpu_sat:.0%} idle on I/O; "
+            f"≈{w_opt} workers may overlap that (pool size cores÷CPU-frac, E-cores past {cores} "
+            f"discounted by the I/O fraction). Try --workers {w_opt} — measure: a shared DB or the "
+            f"E-core tax can still cancel the gain."
+        )
+    return f"near-optimal at {num_workers}w — wall ≈ work/cores, little headroom."
+
+
+def _detailed_par_lines(m: ParMetrics, run: float, num_workers: int, cores: int, logical: int) -> list[str]:
+    """Render the `--detailed` parallelism block. Beyond the raw ratios it surfaces: absolute
+    idle-seconds (not just '×'), idle core-equivalents (I/O-wait headroom — a FACT; the verdict
+    decides what it means), a balance read (count-spread is healthy when wall-spread is tiny —
+    work-stealing balances by TIME), the duration tail (floor is only the max), and a verdict with
+    a deterministic worker-count suggestion. `cores` = perf cores, `logical` = the hard cap."""
+    if m["cpu_sat"] >= 0.75:
+        bound = "compute-bound"
+    elif m["cpu_sat"] <= 0.40:
+        bound = "I/O-bound"
+    else:
+        bound = "mixed"
+    if m["wall_spread"] <= 0.10:
+        balance = f"by time — counts vary {m['ran_ratio']:.1f}x, walls within {m['wall_spread']:.0%} (healthy)"
+    else:
+        balance = f"UNEVEN — walls spread {m['wall_spread']:.0%} (straggler — see verdict)"
+    return [
+        "  detail —",
+        f"    eff     : {m['eff']:.0%}   (ideal wall {m['ideal_wall']:.2f}s vs {run:.2f}s actual)",
+        f"    cpu     : {m['cpu_par']:.2f}x of {num_workers}  ·  {m['cpu_sat']:.0%} CPU / {1 - m['cpu_sat']:.0%} I/O "
+        f"({bound})  ·  ~{m['idle_cores']:.1f} cores idle ({m['io_cores']:.1f} on I/O)",
+        f"    lost    : {m['bus_wait_s'] + m['drain_s']:.2f} worker-s idle  =  "
+        f"bus {m['bus_wait_s']:.2f}s + tail {m['drain_s']:.2f}s",
+        f"    balance : {balance}  (ran {m['ran_min']}–{m['ran_max']}/w)",
+        f"    floor   : {m['floor']:.2f}s  {m['floor_nodeid']}  ·  {m['n_slow']} tests ≥1s, p99 {m['p99']:.2f}s",
+        f"    verdict : {_par_verdict(m, num_workers, cores, logical)}",
+    ]
 
 
 # ── logging helper ───────────────────────────────────────────────────────────
@@ -542,8 +731,216 @@ def _durations_lines(results: list[RunResult], limit: int = 15, min_dur: float =
     return out
 
 
+# `bench` thresholds — fixed constants so every finding is a deterministic function of the
+# measured numbers, never a tuned/learned guess.
+_BENCH_CLUSTER_MIN = 5  # ≥ this many tests sharing a heavy setup → a scope-widening cluster
+_BENCH_SETUP_MIN_S = 0.05  # a setup phase this long counts as "heavy"
+_BENCH_LEVER_MIN_S = 0.5  # don't report a lever that reclaims less than this
+_BENCH_TOP_CALLS = 20  # how many slowest CALL phases to classify
+_BENCH_MAX_LEVERS = 12
+_BENCH_IO_FRAC = 0.20  # cpu/total below this → I/O-bound
+_BENCH_CPU_FRAC = 0.80  # cpu/total above this → CPU-bound
+_BENCH_CV = 0.40  # per-test coefficient of variation above this (≥2 runs) → unstable timing
+_BENCH_PROFILE_NODES = 12  # how many top bottleneck tests the targeted cProfile pass re-runs
+
+
+def _phase_split(result: RunResult) -> tuple[float, float, float]:
+    """(setup, call, teardown) wall seconds from a result's per-phase reports (full-report mode)."""
+    setup = call = teardown = 0.0
+    for rep in result.get("reports", []):
+        when, dur = rep.get("when"), rep.get("duration")
+        if isinstance(dur, int | float) and dur == dur:  # dur == dur drops NaN
+            if when == "setup":
+                setup += float(dur)
+            elif when == "call":
+                call += float(dur)
+            elif when == "teardown":
+                teardown += float(dur)
+    return setup, call, teardown
+
+
+def _bench_report(
+    result_runs: list[list[RunResult]],
+    run: float,
+    cores: int,
+    warmup_dropped: bool = False,
+    profiles: dict[str, list[tuple[str, int, float, float]]] | None = None,
+) -> str:
+    """Deterministic bottleneck report for `pytest-fast --bench[=N]`. Every lever is (measured number →
+    fixed rule → reclaimable worker-seconds), ranked by impact — NO heuristics. Needs full-report
+    mode (per-phase setup/call/teardown) + per-test `cpu`. Two lever families:
+
+      • SHARED SETUP — K tests in one file each paying ~S setup is K·S worker-seconds; a
+        session/module-scoped fixture pays it once → reclaim ≈ (K−1)·S. Marked [potential] because
+        whether the fixture is scope-widenable can't be read from timings (only the upper bound can).
+      • per-test CALL hot-spots — the slowest call phases, classified by `cpu/total`: I/O-bound
+        (waiting on DB/network), CPU-bound (algorithmic), or setup-heavy.
+
+    `result_runs` is one or more runs (the caller drops the warmup); per-test timings are AVERAGED
+    across them so the ranking isn't ruled by one noisy sample. The header states the deterministic
+    ceiling: best wall ≈ max(Σbusy/cores, longest-test)."""
+    from collections import defaultdict
+
+    line = "═" * 66
+    # Average each test's timings across the runs it appeared in: [appearances, total, cpu, s, c, t].
+    acc: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    samples: dict[str, list[float]] = defaultdict(list)  # per-test total durations across runs → variance
+    for results in result_runs:
+        for r in results:
+            s, c, t = _phase_split(r)
+            a = acc[r["nodeid"]]
+            a[0] += 1
+            a[1] += r["duration"]
+            a[2] += max(0.0, r.get("cpu", 0.0))
+            a[3] += s
+            a[4] += c
+            a[5] += t
+            samples[r["nodeid"]].append(r["duration"])
+    recs = [
+        (nid, nid.split("::", 1)[0], a[1] / a[0], a[2] / a[0], a[3] / a[0], a[4] / a[0], a[5] / a[0])
+        for nid, a in acc.items()
+        if a[0]
+    ]
+    n_tests = len(recs)
+    n_runs = len(result_runs)
+    sum_total = sum(x[2] for x in recs)
+    sum_setup = sum(x[4] for x in recs)
+    sum_call = sum(x[5] for x in recs)
+    sum_teardown = sum(x[6] for x in recs)
+    floor, floor_id = max(((x[2], x[0]) for x in recs), default=(0.0, ""))
+    ideal = sum_total / cores if cores else 0.0
+    best = max(ideal, floor)
+    means = sorted(x[2] for x in recs)
+
+    def _pct(q: float) -> float:
+        return means[min(len(means) - 1, round(q * (len(means) - 1)))] if means else 0.0
+
+    avg_note = f"avg of {n_runs} run{'s' if n_runs != 1 else ''}" + (" + warmup dropped" if warmup_dropped else "")
+    out = [
+        f"\n{line}",
+        f"  pytest-fast bench  —  {n_tests} tests, {run:.2f}s wall @ {cores}w  ({avg_note})",
+        line,
+        f"  best @ {cores} cores ≈ {best:.2f}s   ·   floor (longest test) {floor:.2f}s  {floor_id}",
+    ]
+    if sum_total > 0:
+        out.append(
+            f"  where time goes: setup {sum_setup / sum_total:.0%} · call {sum_call / sum_total:.0%} · "
+            f"teardown {sum_teardown / sum_total:.0%}   (of {sum_total:.0f}s test-wall)"
+        )
+        out.append(
+            f"  per-test wall : p50 {_pct(0.5):.3f}s · p90 {_pct(0.9):.3f}s · p99 {_pct(0.99):.3f}s · max {floor:.2f}s"
+        )
+
+    levers: list[tuple[float, str, list[str]]] = []
+
+    # 1. SHARED-SETUP clusters — by file.
+    by_file: dict[str, list[float]] = defaultdict(list)
+    for _nodeid, file, _total, _cpu, setup, _call, _teardown in recs:
+        if setup >= _BENCH_SETUP_MIN_S:
+            by_file[file].append(setup)
+    for file, setups in by_file.items():
+        if len(setups) < _BENCH_CLUSTER_MIN:
+            continue
+        tot = sum(setups)
+        one = tot / len(setups)
+        saving = tot - one  # session-scope pays one setup instead of len(setups)
+        if saving >= _BENCH_LEVER_MIN_S:
+            levers.append(
+                (
+                    saving,
+                    "SHARED SETUP",
+                    [
+                        f"{file} — {len(setups)} tests × ~{one:.2f}s setup = {tot:.1f}s total",
+                        f"→ session/module-scope the fixture (if scope-widenable): ~{one:.2f}s once → "
+                        f"reclaim ~{saving:.1f} worker-s (~{saving / cores:.1f}s wall@{cores}w) [potential]",
+                    ],
+                )
+            )
+
+    # 2. per-test CALL hot-spots — slowest call phases, classified.
+    for nodeid, _file, total, cpu, setup, call, teardown in sorted(recs, key=lambda x: x[5], reverse=True)[
+        :_BENCH_TOP_CALLS
+    ]:
+        if call < _BENCH_LEVER_MIN_S:
+            break
+        cpu_frac = (cpu / total) if (cpu >= 0 and total > 0) else -1.0
+        off_cpu = max(0.0, total - cpu) if cpu >= 0 else -1.0
+        # Tips state only what the timings DETERMINE (where the cost is), never a guessed cause/fix
+        # (whether it's a query, a sleep, a subprocess, an algorithm — timings can't tell).
+        if setup > call and setup >= _BENCH_SETUP_MIN_S:
+            cat, tip = "SETUP-HEAVY", f"cost is fixture setup ({setup:.2f}s > call {call:.2f}s), not the test body"
+        elif 0 <= cpu_frac < _BENCH_IO_FRAC:
+            cat, tip = (
+                "I/O-BOUND",
+                f"{off_cpu:.2f}s off-CPU (I/O wait) — cost is outside Python; CPU/more-workers won't cut it",
+            )
+        elif cpu_frac > _BENCH_CPU_FRAC:
+            cat, tip = "CPU-BOUND", f"{cpu:.2f}s on-CPU — real compute; bounded by core speed"
+        else:
+            cat, tip = "MIXED", "cost split across CPU and I/O — see the phase breakdown"
+        cpu_note = f", {cpu_frac:.0%} CPU" if cpu_frac >= 0 else ""
+        body = [
+            f"{nodeid}  ({total:.2f}s: setup {setup:.2f}/call {call:.2f}/teardown {teardown:.2f}{cpu_note})",
+            f"→ {tip}",
+        ]
+        rows = (profiles or {}).get(nodeid)
+        if rows:
+            body.append("profile (top by SELF wall — where it's actually burned; ncalls exact):")
+            body.extend(f"  {self_t:6.3f}s self  {nc:>8,}×  {name}" for name, nc, self_t, _cum in rows)
+        levers.append((call, cat, body))
+
+    levers.sort(key=lambda x: x[0], reverse=True)
+    if levers:
+        out.append("  ── levers (ranked by reclaimable worker-seconds) ─────────────────")
+        for i, (saving, cat, body) in enumerate(levers[:_BENCH_MAX_LEVERS], 1):
+            out.append(f"  {i:>2}. {cat:<12} ~{saving:5.1f} w-s")
+            out.extend(f"      {ln}" for ln in body)
+    else:
+        out.append("  no levers above the reporting threshold — the suite is already lean.")
+
+    # Unstable timing — needs ≥2 measured runs (so --bench=3+). cv = stdev/mean per test; a high cv
+    # is a measured fact (flaky perf / ordering-sensitive / contended), not a heuristic. Ranked by
+    # cv·mean (the wall actually at stake), only for tests big enough to matter.
+    unstable: list[tuple[float, str, float, float]] = []
+    for nid, xs in samples.items():
+        if len(xs) >= 2:
+            m = sum(xs) / len(xs)
+            if m >= _BENCH_LEVER_MIN_S:
+                sd = math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+                if m and sd / m >= _BENCH_CV:
+                    unstable.append((sd / m, nid, m, sd))
+    if unstable:
+        unstable.sort(key=lambda u: u[0] * u[2], reverse=True)
+        out.append(f"  ── unstable timing (cv ≥ {_BENCH_CV:.0%} across {n_runs} runs) ──────────────────────")
+        out.extend(f"      {nid}  {m:.2f}s ±{sd:.2f}s  (cv {cv:.0%})" for cv, nid, m, sd in unstable[:8])
+    elif n_runs < 2:
+        out.append("  (timing-stability needs ≥2 measured runs — try --bench=3+)")
+    out.append(line)
+    return "\n".join(out)
+
+
+def _top_profile_rows(pr: cProfile.Profile, limit: int = 8) -> list[tuple[str, int, float, float]]:
+    """Top functions of a finished `cProfile.Profile`, by SELF time (`inlinetime`) — time spent IN
+    the function, excluding subcalls. Self time (not cumulative) surfaces the actual leaves where the
+    wall is burned — a blocking syscall, a hot compute loop, a repeated query — instead of the
+    pytest/pluggy wrapper chain (whose cumulative time is ~the whole test but tells you nothing).
+    Each row is (qualname, ncalls, selftime, cumtime); ncalls are EXACT, so a leaf called 47× in one
+    test is the measured (not guessed) N+1 / hot-call signal. Plain builtins → whitelist-safe."""
+    rows: list[tuple[float, float, int, str]] = []
+    for e in pr.getstats():
+        code = e.code
+        if isinstance(code, str):
+            label = code  # a built-in, e.g. "<built-in method ... read>" / "<method 'recv' ...>"
+        else:
+            short = code.co_filename.rsplit("/", 1)[-1]
+            label = f"{code.co_name} ({short}:{code.co_firstlineno})"
+        rows.append((e.inlinetime, e.totaltime, e.callcount, label[:70]))
+    rows.sort(reverse=True)  # by self time
+    return [(lbl, nc, round(self_t, 4), round(cum_t, 4)) for self_t, cum_t, nc, lbl in rows[:limit]]
+
+
 def _run_one_item(
-    item: Item, nextitem: Item | None, collector: _ReportCollector, *, full_report: bool = False
+    item: Item, nextitem: Item | None, collector: _ReportCollector, *, full_report: bool = False, profile: bool = False
 ) -> RunResult:
     """Run a test via the FULL pytest protocol (hook, not function): setup/call/
     teardown, capture, rerunfailures, makereport — behavior 1-to-1 with regular pytest.
@@ -551,12 +948,27 @@ def _run_one_item(
     `full_report=True` also attaches every phase report in pytest's serializable wire form
     (`pytest_report_to_serializable` → plain builtins, whitelist-safe) so the master/controller
     can replay them through a real terminalreporter (--durations, junit, -v/-s, plugins). Off by
-    default — the lean path ships only the outcome summary."""
+    default — the lean path ships only the outcome summary.
+
+    `profile=True` (the `bench` targeted pass over its top bottleneck tests) runs the protocol under
+    `cProfile` and attaches the top-by-cumtime functions → deterministic where-in-the-code attribution."""
     collector.reports.clear()
-    item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+    pr = None
+    if profile:
+        import cProfile
+
+        pr = cProfile.Profile()
+        pr.enable()
+    try:
+        item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+    finally:
+        if pr is not None:
+            pr.disable()
     duration = sum(r.duration for r in collector.reports)
     outcome = categorize(item.config, collector.reports)
     result: RunResult = {"nodeid": item.nodeid, "outcome": outcome, "duration": duration}
+    if pr is not None:
+        result["profile"] = _top_profile_rows(pr)
     if outcome in {"failed", "error"}:
         result["longrepr"] = _failure_text(collector.reports)  # traceback only for reds
     if full_report:
@@ -581,7 +993,9 @@ def _worker_hang_timeout() -> float:
         return 0.0
 
 
-def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodeids: bool = False) -> None:
+def _worker_main(
+    wid: int, sock_path: str, full_report: bool = False, send_nodeids: bool = False, profile: bool = False
+) -> None:
     # IMPORTANT: read globals via `import pytest_fast`, NOT as bare names. `_collect()`
     # set them on the PRELOADED "pytest_fast" module (forkserver) / at import (spawn),
     # whereas `_worker_main`'s own globals are __main__/__mp_main__ (collect did NOT run there).
@@ -617,13 +1031,17 @@ def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodei
             faulthandler.enable()
 
     run_start = time.perf_counter()
-    busy = 0.0
+    busy = 0.0  # wall inside the runtest protocol
+    cpu = 0.0  # this worker's CPU time over that same span (busy − cpu ≈ I/O wait)
+    bus_wait = 0.0  # idle between tests, waiting for the master to hand out the next index
     ran = 0
     prev: Item | None = None
     pending: RunResult | None = None
     while True:
+        t_bus = time.perf_counter()
         _send(sock, ("req", wid, pending))
         reply, _ = _recv(sock)
+        bus_wait += time.perf_counter() - t_bus  # send result + wait for next idx = non-busy gap
         # Master gone / malformed reply → break out and exit cleanly (os._exit below). The
         # master sees EOF and the run is flagged untrusted via the result undercount.
         if not isinstance(reply, tuple) or len(reply) < 2:
@@ -633,10 +1051,11 @@ def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodei
         cur = items[idx] if isinstance(idx, int) and 0 <= idx < len(items) else None
         if prev is not None:
             t0 = time.perf_counter()
+            c0 = time.process_time()
             if faulthandler_mod is not None:
                 faulthandler_mod.dump_traceback_later(hang_timeout, repeat=True, exit=False)
             try:
-                pending = _run_one_item(prev, cur, collector, full_report=full_report)
+                pending = _run_one_item(prev, cur, collector, full_report=full_report, profile=profile)
             except BaseException:
                 if faulthandler_mod is not None:
                     faulthandler_mod.cancel_dump_traceback_later()
@@ -653,11 +1072,21 @@ def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodei
             if faulthandler_mod is not None:
                 faulthandler_mod.cancel_dump_traceback_later()
             busy += time.perf_counter() - t0
+            cpu_this = time.process_time() - c0
+            cpu += cpu_this
+            pending["cpu"] = cpu_this  # per-test CPU → `bench` I/O-vs-CPU classification
             ran += 1
         else:
             pending = None
         if cur is None:
-            stats: WorkerStats = {"wid": wid, "ran": ran, "busy": busy, "run_wall": time.perf_counter() - run_start}
+            stats: WorkerStats = {
+                "wid": wid,
+                "ran": ran,
+                "busy": busy,
+                "cpu": cpu,
+                "bus_wait": bus_wait,
+                "run_wall": time.perf_counter() - run_start,
+            }
             _send(sock, ("fin", wid, pending, stats))
             break
         prev = cur
@@ -737,11 +1166,16 @@ class Daemon:
 
     # ── public modes ─────────────────────────────────────────────────────────
 
-    def run(self, runs: int, *, full_report: bool = False) -> int:
-        """Local mode: single-shot (runs=1) or N runs in one process."""
+    def run(self, runs: int, *, full_report: bool = False, detailed: bool = False, bench: int = 0) -> int:
+        """Local mode: single-shot (runs=1) or N runs in one process. `bench=N` is its own N-run
+        loop (warmup dropped) → one bottleneck report; it ignores `runs`."""
+        if bench > 0:
+            rc, summary = self._run_bench(bench)
+            print(summary)
+            return rc
         rc = 0
         for _ in range(runs):
-            rc, summary = self._run_once(full_report=full_report)
+            rc, summary = self._run_once(full_report=full_report, detailed=detailed)
             print(summary)
         return rc
 
@@ -847,7 +1281,7 @@ class Daemon:
                         # {stale} and EXIT — i.e. any stray frame could shut the resident daemon
                         # down (a same-user DoS). Real clients always send the verb "run".
                         continue
-                    # run request: ('run', fp[, full_report[, stream[, nodeids]]])
+                    # run request: ('run', fp[, full_report[, stream[, nodeids[, detailed]]]])
                     reason = _stale_reason(boot_mtime, boot_fp, client_fp)
                     if reason is not None:
                         _log("daemon", f"{reason} — exiting stale")
@@ -862,15 +1296,23 @@ class Daemon:
                     selection = (
                         cast("list[str]", fp_args[3]) if len(fp_args) > 3 and isinstance(fp_args[3], list) else None
                     )
+                    # `detailed` (CLI `--detailed`) adds the extended parallelism block; `bench`
+                    # (CLI `--bench=N`, an int run-count) renders the deterministic bottleneck report
+                    # instead (N runs, warmup dropped, full reports forced internally). Both are
+                    # irrelevant in stream mode (the plugin controller renders natively).
+                    detailed = len(fp_args) > 4 and bool(fp_args[4])
+                    bench = int(fp_args[5]) if len(fp_args) > 5 and isinstance(fp_args[5], int) else 0
                     if stream:
                         # Controller renders natively from the streamed reports → no daemon-side
                         # progress frames (progress_conn=None), full reports required.
                         rc, summary = self._run_once(full_report=True, report_conn=conn, selection=selection)
+                    elif bench > 0:
+                        rc, summary = self._run_bench(bench, progress_conn=conn)
                     else:
                         # progress_conn=conn: workers write dots into the DAEMON log, not the
                         # client's terminal — so we stream progress over this same socket
                         # (otherwise the client sits silent the whole run and looks frozen).
-                        rc, summary = self._run_once(progress_conn=conn, full_report=full_report)
+                        rc, summary = self._run_once(progress_conn=conn, full_report=full_report, detailed=detailed)
                     try:
                         _send(conn, {"rc": rc, "summary": summary})
                     except OSError:
@@ -884,14 +1326,18 @@ class Daemon:
 
     # ── one run (fork workers + work-stealing dispatch) ──────────────────────
 
-    def _run_once(
+    def _execute_run(
         self,
-        progress_conn: socket.socket | None = None,
+        progress_conn: socket.socket | None,
         *,
-        full_report: bool = False,
-        report_conn: socket.socket | None = None,
-        selection: list[str] | None = None,
-    ) -> tuple[int, str]:
+        full_report: bool,
+        report_conn: socket.socket | None,
+        selection: list[str] | None,
+        profile: bool = False,
+    ) -> _RunOutcome:
+        """One fork→serve→collect cycle. Returns raw results + timing + integrity, NO rendering —
+        shared by the single-run `_run_once` and the N-run `_run_bench`. `profile` (the bench
+        targeted pass) makes the workers run each test under cProfile."""
         idx = self._run_counter
         self._run_counter += 1
         t0 = time.perf_counter()
@@ -906,7 +1352,9 @@ class Daemon:
 
         send_nodeids = selection is not None
         procs = [
-            self.ctx.Process(target=_worker_main, args=(wid, sock_path, full_report, send_nodeids), daemon=True)
+            self.ctx.Process(
+                target=_worker_main, args=(wid, sock_path, full_report, send_nodeids, profile), daemon=True
+            )
             for wid in range(self.num_workers)
         ]
         self._arm_collect_flag()  # local-run mode (serve() also calls; repeated invocation is idempotent)
@@ -940,32 +1388,108 @@ class Daemon:
             with Path(self.dump_path).open("w") as f:
                 json.dump({r["nodeid"]: r["outcome"] for r in results}, f, indent=0, sort_keys=True)
 
-        label = "BOOT (collect once)" if idx == 0 else f"run #{idx} (warm)"
-        summary = self._report(
-            results,
-            worker_stats,
-            bus,
-            total,
+        return _RunOutcome(
+            results=results,
+            worker_stats=worker_stats,
+            bus=bus,
             warmup=t_ready - t0,
-            run=t_done - t_ready,
+            run_wall=t_done - t_ready,
+            total=total,
+            idx=idx,
+            exitcodes=[p.exitcode for p in procs],
+        )
+
+    @staticmethod
+    def _run_untrusted(o: _RunOutcome) -> bool:
+        """A worker may die BEFORE sending results (import/assert in `_worker_main`) → results are
+        partial and rc would be a false green (possibly n=0/0). A non-zero worker exitcode OR a
+        result undercount (< collected total) → the run is NOT trusted."""
+        crashed = any(code not in (0, None) for code in o.exitcodes)
+        incomplete = o.total > 0 and len(o.results) < o.total
+        return crashed or incomplete
+
+    def _run_once(
+        self,
+        progress_conn: socket.socket | None = None,
+        *,
+        full_report: bool = False,
+        report_conn: socket.socket | None = None,
+        selection: list[str] | None = None,
+        detailed: bool = False,
+    ) -> tuple[int, str]:
+        o = self._execute_run(progress_conn, full_report=full_report, report_conn=report_conn, selection=selection)
+        label = "BOOT (collect once)" if o.idx == 0 else f"run #{o.idx} (warm)"
+        summary = self._report(
+            o.results,
+            o.worker_stats,
+            o.bus,
+            o.total,
+            warmup=o.warmup,
+            run=o.run_wall,
             label=label,
             full_report=full_report,
+            detailed=detailed,
         )
-        rc = 1 if any(r["outcome"] in {"failed", "error"} for r in results) else 0
-        # Run integrity: a worker may have died BEFORE sending results (import/assert in
-        # `_worker_main`) — then `results` are empty/partial and rc would be 0 (a false
-        # green, possibly n=0/0). Any non-zero worker exitcode OR a result undercount
-        # (< collected total) → run is NOT trusted, force rc=1 (codex P1).
-        exitcodes = [p.exitcode for p in procs]
-        crashed = any(code not in (0, None) for code in exitcodes)
-        incomplete = total > 0 and len(results) < total
-        if crashed or incomplete:
+        rc = 1 if any(r["outcome"] in {"failed", "error"} for r in o.results) else 0
+        if self._run_untrusted(o):
             rc = 1
             summary += (
                 f"\n  ⚠ UNTRUSTED RUN — worker crashed / result undercount: "
-                f"results={len(results)}/{total}, worker exitcodes={exitcodes} (see daemon log)"
+                f"results={len(o.results)}/{o.total}, worker exitcodes={o.exitcodes} (see daemon log)"
             )
         return rc, summary
+
+    def _run_bench(self, n_runs: int, progress_conn: socket.socket | None = None) -> tuple[int, str]:
+        """`--bench=N`: run the suite N times (full reports), drop the FIRST as warmup (its fork +
+        first-touch DB/cache costs are unrepresentative), render the deterministic bottleneck report
+        over the averaged remainder. N=1 keeps the single (warmup-tainted) run. Then a TARGETED
+        cProfile pass over just the top bottleneck tests adds function-level attribution — wise
+        orchestration: pay the profiler's overhead only on the handful of tests that hold the wall."""
+        runs = [
+            self._execute_run(progress_conn, full_report=True, report_conn=None, selection=None)
+            for _ in range(max(1, n_runs))
+        ]
+        measured = runs[1:] if len(runs) > 1 else runs  # drop warmup when we have more than one
+        avg_wall = sum(o.run_wall for o in measured) / len(measured)
+        result_runs = [o.results for o in measured]
+        profiles = self._profile_top_tests(result_runs)
+        summary = _bench_report(
+            result_runs,
+            run=avg_wall,
+            cores=self.num_workers,  # the ACTUAL parallelism of this run, not the machine default
+            warmup_dropped=len(runs) > 1,
+            profiles=profiles,
+        )
+        rc = (
+            1
+            if any(self._run_untrusted(o) or any(r["outcome"] in {"failed", "error"} for r in o.results) for o in runs)
+            else 0
+        )
+        return rc, summary
+
+    def _profile_top_tests(self, result_runs: list[list[RunResult]]) -> dict[str, list[tuple[str, int, float, float]]]:
+        """Targeted cProfile pass: rank tests by average wall, re-run ONLY the top
+        `_BENCH_PROFILE_NODES` under cProfile (one extra run of a handful of tests, cheap against the
+        warm forkserver), and return {nodeid: top cProfile rows}. Best-effort — any failure just
+        means the bench report renders without function-level attribution."""
+        from collections import defaultdict
+
+        agg: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])  # nodeid → [count, sum(duration)]
+        for results in result_runs:
+            for r in results:
+                a = agg[r["nodeid"]]
+                a[0] += 1
+                a[1] += r["duration"]
+        ranked = sorted(((a[1] / a[0], nid) for nid, a in agg.items() if a[0]), reverse=True)
+        top = [nid for _dur, nid in ranked[:_BENCH_PROFILE_NODES]]
+        if not top:
+            return {}
+        try:
+            o = self._execute_run(None, full_report=False, report_conn=None, selection=top, profile=True)
+        except Exception as exc:
+            _log("daemon", f"bench profiling pass failed ({exc!r}) — report renders without profiles")
+            return {}
+        return {r["nodeid"]: r["profile"] for r in o.results if "profile" in r}
 
     def _serve_bus(
         self,
@@ -1113,6 +1637,7 @@ class Daemon:
         run: float,
         label: str,
         full_report: bool = False,
+        detailed: bool = False,
     ) -> str:
         from collections import Counter
 
@@ -1131,8 +1656,15 @@ class Daemon:
             f"  RUN     : {run:6.2f}s   ← wall",
             f"  par.    : {(sum_busy / run if run else 0):.2f}x of {self.num_workers}"
             f"   (run-wall max={max(run_walls) if run_walls else 0:.2f} min={min(run_walls) if run_walls else 0:.2f})",
-            f"  bus     : {int(bus['req_count'])} round-trips, {bus['rx'] / 1024:.0f}KB rx",
         ]
+        if detailed:
+            metrics = _parallelism_metrics(worker_stats, run, self.num_workers, results)
+            # cores = perf-core count (the throughput baseline + the default worker count);
+            # logical = the hard cap for any worker-count suggestion.
+            cores = _default_workers()
+            logical = os.cpu_count() or cores
+            out.extend(_detailed_par_lines(metrics, run, self.num_workers, cores, logical))
+        out.append(f"  bus     : {int(bus['req_count'])} round-trips, {bus['rx'] / 1024:.0f}KB rx")
         if failed:
             out.append(f"  FAILURES ({failed}):")
             for r in results:
@@ -1163,7 +1695,9 @@ class Daemon:
 # ── client-side: request a run from the resident daemon ──────────────────────
 
 
-def request_run(address: str, *, full_report: bool = False) -> dict[str, object]:
+def request_run(
+    address: str, *, full_report: bool = False, detailed: bool = False, bench: int = 0
+) -> dict[str, object]:
     """Trigger a run on the daemon; stream progress to stdout, return the final frame
     (`{rc, summary}` or `{stale: True}`). The daemon sends N `{'progress': (done,total)}`
     frames then one final frame — we recv in a loop until a non-progress frame arrives.
@@ -1178,7 +1712,11 @@ def request_run(address: str, *, full_report: bool = False) -> dict[str, object]
     with _short_unix_path(address) as connect_path:
         sock.connect(connect_path)
     with sock:
-        _send(sock, ("run", _env_fingerprint(), full_report))  # fp (stale-check) + report mode
+        # ('run', fp, full_report, stream, nodeids, detailed, bench) — non-streamed CLI run, so
+        # stream=False / nodeids=None; `bench` (an int run-count, 0=off) makes the daemon render the
+        # bottleneck report (it forces full reports itself). Trailing elements are ignored by a
+        # daemon predating them (back-compatible).
+        _send(sock, ("run", _env_fingerprint(), full_report, False, None, detailed, bench))
         while True:
             raw, _ = _recv(sock)
             if not isinstance(raw, dict):
@@ -1664,7 +2202,15 @@ def _run_via_daemon(
 
 
 def _ensure_and_run(
-    workers: int, start_method: str, address: str, ttl: float, *, with_watcher: bool, full_report: bool = False
+    workers: int,
+    start_method: str,
+    address: str,
+    ttl: float,
+    *,
+    with_watcher: bool,
+    full_report: bool = False,
+    detailed: bool = False,
+    bench: int = 0,
 ) -> int:
     """CLI client (front A): connect to the daemon → run → print the daemon-rendered summary."""
     reply = _run_via_daemon(
@@ -1673,7 +2219,7 @@ def _ensure_and_run(
         address,
         ttl,
         with_watcher=with_watcher,
-        run=lambda addr: request_run(addr, full_report=full_report),
+        run=lambda addr: request_run(addr, full_report=full_report, detailed=detailed, bench=bench),
     )
     summary = reply.get("summary")
     if summary is not None:
@@ -1908,19 +2454,21 @@ def pytest_runtestloop(session: Session) -> bool | None:
 # the idle gap AFTER an edit, so by the time the user re-runs tests the daemon is
 # already warm and fresh.
 
-_WATCH_POLL = 0.5  # seconds between max(mtime) polls
-_WATCH_DEBOUNCE = 0.7  # seconds of silence after the last edit → one reboot per batch of Edits
+# Watch poll/debounce are env-overridable (`PYTEST_FAST_WATCH_POLL` / `_DEBOUNCE`, seconds): tune
+# reactivity vs CPU, and let the test suite drop them to ~0.05 so watcher tests run in ~0.3s instead
+# of ~2.7s. Read at module load → a freshly-spawned watcher subprocess picks up the caller's env.
+_WATCH_POLL = float(os.environ.get("PYTEST_FAST_WATCH_POLL", "0.5"))  # seconds between max(mtime) polls
+_WATCH_DEBOUNCE = float(os.environ.get("PYTEST_FAST_WATCH_DEBOUNCE", "0.7"))  # silence after last edit → one reboot
 _WATCH_GONE_GRACE = 3.0  # seconds without the daemon → watcher exits (lifetime tied to daemon ttl)
 _STAGING_BOOT_TIMEOUT = 90.0  # upper bound on successor boot (normal ~3s;
 # a broken edit is caught immediately via process death in _await_ready, not this timeout)
 
 # Poll intervals inside await-loops (sleep between two condition checks). Smaller =
-# faster response + slightly more CPU; larger = more reaction delay. These differ on
-# purpose: ready-status is more expensive than a PID probe, hence rarer; PID probe is
-# cheap → faster.
-_READY_POLL_INTERVAL = 0.2
-_PID_DEAD_POLL_INTERVAL = 0.05
-_DEBOUNCE_POLL_INTERVAL = 0.1
+# faster response + slightly more CPU; larger = more reaction delay. Kept small — a daemon boots
+# in well under 100ms, so a 0.2s ready-poll was pure dead time on every spawn (×20+ tests).
+_READY_POLL_INTERVAL = 0.02
+_PID_DEAD_POLL_INTERVAL = 0.02
+_DEBOUNCE_POLL_INTERVAL = 0.05
 
 # Network/IPC timeouts.
 _WORKER_ACCEPT_TIMEOUT = 60.0  # seconds for each worker's connect to the master server
@@ -2107,6 +2655,23 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="ship full per-phase reports → a real --durations table in the summary (heavier bus)",
     )
+    parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="add the extended parallelism block to the summary (eff%%, CPU vs I/O, lost-time "
+        "breakdown, per-worker spread, the wall-bounding test)",
+    )
+    parser.add_argument(
+        "--bench",
+        nargs="?",
+        const=2,
+        default=0,
+        type=int,
+        metavar="N",
+        help="run the suite N times (default 2; the first is dropped as warmup) and print a "
+        "deterministic bottleneck report instead of the run summary — shared-setup clusters, slowest "
+        "CPU/IO calls, the wall ceiling — what to optimize to go faster. More runs → steadier ranking",
+    )
     ns = parser.parse_args(argv)
     try:
         workers = _resolve_workers(ns.workers)
@@ -2134,9 +2699,11 @@ def main(argv: list[str]) -> int:
             ttl,
             with_watcher=ns.with_watcher,
             full_report=ns.full_report,
+            detailed=ns.detailed,
+            bench=ns.bench,
         )
     return Daemon(num_workers=workers, start_method=ns.start_method, dump_path=ns.dump).run(
-        ns.runs, full_report=ns.full_report
+        ns.runs, full_report=ns.full_report, detailed=ns.detailed, bench=ns.bench
     )
 
 
