@@ -219,14 +219,15 @@ def test_daemon_idle_ttl_self_shutdown(
     pf_cmd: list[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no activity longer than `--ttl` the daemon exits on its own. ttl=2s,
-    we wait <10s — `proc.wait` reaps after self-shutdown."""
+    """With no activity longer than `--ttl` the daemon exits on its own. ttl is small (0.5s):
+    `_await_ready`'s status polls keep resetting the idle timer, so it only counts down once polling
+    stops — a tiny ttl is safe and keeps the test fast. `proc.wait` reaps after self-shutdown."""
     monkeypatch.setenv("PYTEST_FAST_ROOT", str(tmp_project))
-    proc = _spawn(pf_cmd, address=tmp_address, cwd=tmp_project, ttl=2.0)
+    proc = _spawn(pf_cmd, address=tmp_address, cwd=tmp_project, ttl=0.5)
     try:
         assert _await_ready(tmp_address, proc, timeout=30.0)
         rc = proc.wait(timeout=10.0)
-        assert rc == 0, f"daemon should self-shutdown on idle-ttl=2s, exit={rc}"
+        assert rc == 0, f"daemon should self-shutdown on idle-ttl=0.5s, exit={rc}"
         assert not Path(tmp_address).exists()
     finally:
         if proc.poll() is None:

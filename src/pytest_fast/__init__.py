@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
 if TYPE_CHECKING:
+    import cProfile
     from collections.abc import Callable, Iterator
     from multiprocessing.context import DefaultContext
 
@@ -105,6 +106,9 @@ class RunResult(TypedDict):
     outcome: str
     duration: float
     cpu: NotRequired[float]  # per-test process CPU time (duration − cpu ≈ I/O wait); for `bench`
+    # cProfile rows (qualname, ncalls, tottime, cumtime) for the test, top-by-cumtime — only on the
+    # targeted profiling pass `bench` runs over its top bottleneck tests. Deterministic call counts.
+    profile: NotRequired[list[tuple[str, int, float, float]]]
     longrepr: NotRequired[str]  # failure text — only for failed/error
     # Every phase report in pytest's serializable wire form (plain builtins, whitelist-safe),
     # present only in full-report mode — lets the master/controller replay them through a real
@@ -737,6 +741,7 @@ _BENCH_MAX_LEVERS = 12
 _BENCH_IO_FRAC = 0.20  # cpu/total below this → I/O-bound
 _BENCH_CPU_FRAC = 0.80  # cpu/total above this → CPU-bound
 _BENCH_CV = 0.40  # per-test coefficient of variation above this (≥2 runs) → unstable timing
+_BENCH_PROFILE_NODES = 12  # how many top bottleneck tests the targeted cProfile pass re-runs
 
 
 def _phase_split(result: RunResult) -> tuple[float, float, float]:
@@ -754,7 +759,13 @@ def _phase_split(result: RunResult) -> tuple[float, float, float]:
     return setup, call, teardown
 
 
-def _bench_report(result_runs: list[list[RunResult]], run: float, cores: int, warmup_dropped: bool = False) -> str:
+def _bench_report(
+    result_runs: list[list[RunResult]],
+    run: float,
+    cores: int,
+    warmup_dropped: bool = False,
+    profiles: dict[str, list[tuple[str, int, float, float]]] | None = None,
+) -> str:
     """Deterministic bottleneck report for `pytest-fast --bench[=N]`. Every lever is (measured number →
     fixed rule → reclaimable worker-seconds), ranked by impact — NO heuristics. Needs full-report
     mode (per-phase setup/call/teardown) + per-test `cpu`. Two lever families:
@@ -868,16 +879,15 @@ def _bench_report(result_runs: list[list[RunResult]], run: float, cores: int, wa
         else:
             cat, tip = "MIXED", "cost split across CPU and I/O — see the phase breakdown"
         cpu_note = f", {cpu_frac:.0%} CPU" if cpu_frac >= 0 else ""
-        levers.append(
-            (
-                call,
-                cat,
-                [
-                    f"{nodeid}  ({total:.2f}s: setup {setup:.2f}/call {call:.2f}/teardown {teardown:.2f}{cpu_note})",
-                    f"→ {tip}",
-                ],
-            )
-        )
+        body = [
+            f"{nodeid}  ({total:.2f}s: setup {setup:.2f}/call {call:.2f}/teardown {teardown:.2f}{cpu_note})",
+            f"→ {tip}",
+        ]
+        rows = (profiles or {}).get(nodeid)
+        if rows:
+            body.append("profile (top by SELF wall — where it's actually burned; ncalls exact):")
+            body.extend(f"  {self_t:6.3f}s self  {nc:>8,}×  {name}" for name, nc, self_t, _cum in rows)
+        levers.append((call, cat, body))
 
     levers.sort(key=lambda x: x[0], reverse=True)
     if levers:
@@ -909,8 +919,28 @@ def _bench_report(result_runs: list[list[RunResult]], run: float, cores: int, wa
     return "\n".join(out)
 
 
+def _top_profile_rows(pr: cProfile.Profile, limit: int = 8) -> list[tuple[str, int, float, float]]:
+    """Top functions of a finished `cProfile.Profile`, by SELF time (`inlinetime`) — time spent IN
+    the function, excluding subcalls. Self time (not cumulative) surfaces the actual leaves where the
+    wall is burned — a blocking syscall, a hot compute loop, a repeated query — instead of the
+    pytest/pluggy wrapper chain (whose cumulative time is ~the whole test but tells you nothing).
+    Each row is (qualname, ncalls, selftime, cumtime); ncalls are EXACT, so a leaf called 47× in one
+    test is the measured (not guessed) N+1 / hot-call signal. Plain builtins → whitelist-safe."""
+    rows: list[tuple[float, float, int, str]] = []
+    for e in pr.getstats():
+        code = e.code
+        if isinstance(code, str):
+            label = code  # a built-in, e.g. "<built-in method ... read>" / "<method 'recv' ...>"
+        else:
+            short = code.co_filename.rsplit("/", 1)[-1]
+            label = f"{code.co_name} ({short}:{code.co_firstlineno})"
+        rows.append((e.inlinetime, e.totaltime, e.callcount, label[:70]))
+    rows.sort(reverse=True)  # by self time
+    return [(lbl, nc, round(self_t, 4), round(cum_t, 4)) for self_t, cum_t, nc, lbl in rows[:limit]]
+
+
 def _run_one_item(
-    item: Item, nextitem: Item | None, collector: _ReportCollector, *, full_report: bool = False
+    item: Item, nextitem: Item | None, collector: _ReportCollector, *, full_report: bool = False, profile: bool = False
 ) -> RunResult:
     """Run a test via the FULL pytest protocol (hook, not function): setup/call/
     teardown, capture, rerunfailures, makereport — behavior 1-to-1 with regular pytest.
@@ -918,12 +948,27 @@ def _run_one_item(
     `full_report=True` also attaches every phase report in pytest's serializable wire form
     (`pytest_report_to_serializable` → plain builtins, whitelist-safe) so the master/controller
     can replay them through a real terminalreporter (--durations, junit, -v/-s, plugins). Off by
-    default — the lean path ships only the outcome summary."""
+    default — the lean path ships only the outcome summary.
+
+    `profile=True` (the `bench` targeted pass over its top bottleneck tests) runs the protocol under
+    `cProfile` and attaches the top-by-cumtime functions → deterministic where-in-the-code attribution."""
     collector.reports.clear()
-    item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+    pr = None
+    if profile:
+        import cProfile
+
+        pr = cProfile.Profile()
+        pr.enable()
+    try:
+        item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+    finally:
+        if pr is not None:
+            pr.disable()
     duration = sum(r.duration for r in collector.reports)
     outcome = categorize(item.config, collector.reports)
     result: RunResult = {"nodeid": item.nodeid, "outcome": outcome, "duration": duration}
+    if pr is not None:
+        result["profile"] = _top_profile_rows(pr)
     if outcome in {"failed", "error"}:
         result["longrepr"] = _failure_text(collector.reports)  # traceback only for reds
     if full_report:
@@ -948,7 +993,9 @@ def _worker_hang_timeout() -> float:
         return 0.0
 
 
-def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodeids: bool = False) -> None:
+def _worker_main(
+    wid: int, sock_path: str, full_report: bool = False, send_nodeids: bool = False, profile: bool = False
+) -> None:
     # IMPORTANT: read globals via `import pytest_fast`, NOT as bare names. `_collect()`
     # set them on the PRELOADED "pytest_fast" module (forkserver) / at import (spawn),
     # whereas `_worker_main`'s own globals are __main__/__mp_main__ (collect did NOT run there).
@@ -1008,7 +1055,7 @@ def _worker_main(wid: int, sock_path: str, full_report: bool = False, send_nodei
             if faulthandler_mod is not None:
                 faulthandler_mod.dump_traceback_later(hang_timeout, repeat=True, exit=False)
             try:
-                pending = _run_one_item(prev, cur, collector, full_report=full_report)
+                pending = _run_one_item(prev, cur, collector, full_report=full_report, profile=profile)
             except BaseException:
                 if faulthandler_mod is not None:
                     faulthandler_mod.cancel_dump_traceback_later()
@@ -1286,9 +1333,11 @@ class Daemon:
         full_report: bool,
         report_conn: socket.socket | None,
         selection: list[str] | None,
+        profile: bool = False,
     ) -> _RunOutcome:
         """One fork→serve→collect cycle. Returns raw results + timing + integrity, NO rendering —
-        shared by the single-run `_run_once` and the N-run `_run_bench`."""
+        shared by the single-run `_run_once` and the N-run `_run_bench`. `profile` (the bench
+        targeted pass) makes the workers run each test under cProfile."""
         idx = self._run_counter
         self._run_counter += 1
         t0 = time.perf_counter()
@@ -1303,7 +1352,9 @@ class Daemon:
 
         send_nodeids = selection is not None
         procs = [
-            self.ctx.Process(target=_worker_main, args=(wid, sock_path, full_report, send_nodeids), daemon=True)
+            self.ctx.Process(
+                target=_worker_main, args=(wid, sock_path, full_report, send_nodeids, profile), daemon=True
+            )
             for wid in range(self.num_workers)
         ]
         self._arm_collect_flag()  # local-run mode (serve() also calls; repeated invocation is idempotent)
@@ -1390,19 +1441,24 @@ class Daemon:
 
     def _run_bench(self, n_runs: int, progress_conn: socket.socket | None = None) -> tuple[int, str]:
         """`--bench=N`: run the suite N times (full reports), drop the FIRST as warmup (its fork +
-        first-touch DB/cache costs are unrepresentative), and render the deterministic bottleneck
-        report over the averaged remainder. N=1 keeps the single (warmup-tainted) run."""
+        first-touch DB/cache costs are unrepresentative), render the deterministic bottleneck report
+        over the averaged remainder. N=1 keeps the single (warmup-tainted) run. Then a TARGETED
+        cProfile pass over just the top bottleneck tests adds function-level attribution — wise
+        orchestration: pay the profiler's overhead only on the handful of tests that hold the wall."""
         runs = [
             self._execute_run(progress_conn, full_report=True, report_conn=None, selection=None)
             for _ in range(max(1, n_runs))
         ]
         measured = runs[1:] if len(runs) > 1 else runs  # drop warmup when we have more than one
         avg_wall = sum(o.run_wall for o in measured) / len(measured)
+        result_runs = [o.results for o in measured]
+        profiles = self._profile_top_tests(result_runs)
         summary = _bench_report(
-            [o.results for o in measured],
+            result_runs,
             run=avg_wall,
             cores=self.num_workers,  # the ACTUAL parallelism of this run, not the machine default
             warmup_dropped=len(runs) > 1,
+            profiles=profiles,
         )
         rc = (
             1
@@ -1410,6 +1466,30 @@ class Daemon:
             else 0
         )
         return rc, summary
+
+    def _profile_top_tests(self, result_runs: list[list[RunResult]]) -> dict[str, list[tuple[str, int, float, float]]]:
+        """Targeted cProfile pass: rank tests by average wall, re-run ONLY the top
+        `_BENCH_PROFILE_NODES` under cProfile (one extra run of a handful of tests, cheap against the
+        warm forkserver), and return {nodeid: top cProfile rows}. Best-effort — any failure just
+        means the bench report renders without function-level attribution."""
+        from collections import defaultdict
+
+        agg: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])  # nodeid → [count, sum(duration)]
+        for results in result_runs:
+            for r in results:
+                a = agg[r["nodeid"]]
+                a[0] += 1
+                a[1] += r["duration"]
+        ranked = sorted(((a[1] / a[0], nid) for nid, a in agg.items() if a[0]), reverse=True)
+        top = [nid for _dur, nid in ranked[:_BENCH_PROFILE_NODES]]
+        if not top:
+            return {}
+        try:
+            o = self._execute_run(None, full_report=False, report_conn=None, selection=top, profile=True)
+        except Exception as exc:
+            _log("daemon", f"bench profiling pass failed ({exc!r}) — report renders without profiles")
+            return {}
+        return {r["nodeid"]: r["profile"] for r in o.results if "profile" in r}
 
     def _serve_bus(
         self,
@@ -2374,19 +2454,21 @@ def pytest_runtestloop(session: Session) -> bool | None:
 # the idle gap AFTER an edit, so by the time the user re-runs tests the daemon is
 # already warm and fresh.
 
-_WATCH_POLL = 0.5  # seconds between max(mtime) polls
-_WATCH_DEBOUNCE = 0.7  # seconds of silence after the last edit → one reboot per batch of Edits
+# Watch poll/debounce are env-overridable (`PYTEST_FAST_WATCH_POLL` / `_DEBOUNCE`, seconds): tune
+# reactivity vs CPU, and let the test suite drop them to ~0.05 so watcher tests run in ~0.3s instead
+# of ~2.7s. Read at module load → a freshly-spawned watcher subprocess picks up the caller's env.
+_WATCH_POLL = float(os.environ.get("PYTEST_FAST_WATCH_POLL", "0.5"))  # seconds between max(mtime) polls
+_WATCH_DEBOUNCE = float(os.environ.get("PYTEST_FAST_WATCH_DEBOUNCE", "0.7"))  # silence after last edit → one reboot
 _WATCH_GONE_GRACE = 3.0  # seconds without the daemon → watcher exits (lifetime tied to daemon ttl)
 _STAGING_BOOT_TIMEOUT = 90.0  # upper bound on successor boot (normal ~3s;
 # a broken edit is caught immediately via process death in _await_ready, not this timeout)
 
 # Poll intervals inside await-loops (sleep between two condition checks). Smaller =
-# faster response + slightly more CPU; larger = more reaction delay. These differ on
-# purpose: ready-status is more expensive than a PID probe, hence rarer; PID probe is
-# cheap → faster.
-_READY_POLL_INTERVAL = 0.2
-_PID_DEAD_POLL_INTERVAL = 0.05
-_DEBOUNCE_POLL_INTERVAL = 0.1
+# faster response + slightly more CPU; larger = more reaction delay. Kept small — a daemon boots
+# in well under 100ms, so a 0.2s ready-poll was pure dead time on every spawn (×20+ tests).
+_READY_POLL_INTERVAL = 0.02
+_PID_DEAD_POLL_INTERVAL = 0.02
+_DEBOUNCE_POLL_INTERVAL = 0.05
 
 # Network/IPC timeouts.
 _WORKER_ACCEPT_TIMEOUT = 60.0  # seconds for each worker's connect to the master server

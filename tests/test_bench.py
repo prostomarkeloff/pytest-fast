@@ -3,7 +3,7 @@ averaging. Pure (`_bench_report` over synthetic results) — no daemon."""
 
 from __future__ import annotations
 
-from pytest_fast import RunResult, _bench_report, _phase_split
+from pytest_fast import RunResult, _bench_report, _phase_split, _top_profile_rows
 
 
 def _r(nodeid: str, *, cpu: float, setup: float = 0.0, call: float = 0.0, teardown: float = 0.0) -> RunResult:
@@ -71,3 +71,37 @@ def test_bench_flags_unstable_timing_with_multiple_runs() -> None:
     one = _bench_report([[_r("t::steady", cpu=0.1, call=1.0)]], run=2.0, cores=2)
     assert "needs ≥2 measured runs" in one
     assert "p50" in one  # percentiles always present
+
+
+def test_top_profile_rows_counts_calls_exactly() -> None:
+    """cProfile call counts are exact → the deterministic N+1 / hot-call signal."""
+    import cProfile
+
+    def inner() -> int:
+        return sum(range(50))
+
+    def outer() -> None:
+        for _ in range(47):
+            inner()
+
+    pr = cProfile.Profile()
+    pr.enable()
+    outer()
+    pr.disable()
+    rows = _top_profile_rows(pr, limit=30)
+    inner_rows = [r for r in rows if "inner" in r[0]]
+    assert inner_rows and inner_rows[0][1] == 47  # (label, ncalls, self, cum) — exact 47 calls
+
+
+def test_bench_folds_profile_attribution_into_levers() -> None:
+    results = [_r("t::slow", cpu=0.05, call=2.0)]
+    profiles = {
+        "t::slow": [
+            ("<method 'recv' of 'socket'>", 8, 1.9, 1.95),
+            ("get_subscribers (repo.py:21)", 47, 0.05, 0.9),  # high count = N+1, self-evident
+        ]
+    }
+    blob = _bench_report([results], run=2.0, cores=2, profiles=profiles)
+    assert "profile (top by SELF wall" in blob
+    assert "recv" in blob
+    assert "47×" in blob  # the call count makes N+1 visible without a guess

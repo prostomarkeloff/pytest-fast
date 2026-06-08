@@ -273,6 +273,8 @@ If you need Windows or remote fan-out across machines — use xdist. If you spen
 | `PYTEST_FAST_ADDRESS` | (derived) | path | Daemon socket — used by **both** the CLI runner and `pytest --fast`. Prefer this over a bare `--fast-address` path (see the `--fast` caveat above). |
 | `PYTEST_FAST_WORKERS` | (perf cores) | int | Worker count for both front-ends. |
 | `PYTEST_FAST_TTL` | `600` | seconds | Daemon idle TTL for both front-ends. |
+| `PYTEST_FAST_WATCH_POLL` | `0.5` | seconds | `--fast-watch` watcher: interval between source `max(mtime)` polls. Lower = snappier pre-warm, slightly more CPU. |
+| `PYTEST_FAST_WATCH_DEBOUNCE` | `0.7` | seconds | `--fast-watch` watcher: quiet period after the last edit before it promotes a successor — one reboot per burst of edits. |
 | `OUTCOME_DUMP` | `""` | path | With `pytest -p pytest_fast`, writes `{nodeid: outcome}` JSON on sessionfinish — a reference dump for outcome-diff against xdist. |
 
 All listed variables are in the env fingerprint; changing any forces a fresh daemon (you never need to manually kill one).
