@@ -130,6 +130,12 @@ pytest-fast --address /tmp/myproj.sock --workers 6
 # Per-phase --durations in the summary (ships full reports on the bus)
 pytest-fast --address /tmp/myproj.sock --workers 6 --full-report
 
+# Extended parallelism diagnostics (eff, CPU-vs-I/O, lost-time, a worker-count hint)
+pytest-fast --address /tmp/myproj.sock --workers 6 --detailed
+
+# Deterministic bottleneck report — what to optimize to go faster (see below)
+pytest-fast --address /tmp/myproj.sock --workers 6 --bench=4
+
 # Pre-warm: a watcher refreshes the daemon BEFORE you re-run (see Watcher)
 pytest-fast --address /tmp/myproj.sock --workers 6 --with-watcher
 
@@ -161,6 +167,61 @@ pytest-fast --runs 1 --workers 4
 `par. 5.21x of 6` is the actual parallelism — total worker-busy time divided by wall. The closer to N, the better the work-stealing dispatcher kept your workers busy.
 
 The CLI summary is **lossy by design** (counts, failure tracebacks, durations) — it's a bespoke render, not pytest's. Want full native reporting? Use `pytest --fast`. Want the absolute thinnest, fastest loop? Stay here.
+
+---
+
+## Performance diagnostics: `--detailed` and `--bench`
+
+Two opt-in, CLI-runner-only reports (both rendered by the warm daemon — no native-pytest controller cost). Everything they say is a **deterministic** function of measured numbers and a fixed rule — never a heuristic guess. Each worker now also records its CPU time and inter-test bus idle, so the `N × wall` rectangle decomposes exactly and per-test CPU-vs-I/O is known.
+
+### `--detailed` — *why* wasn't it faster, and *should I add workers?*
+
+Adds a block under the `par.` line:
+
+```text
+  par.    : 5.94x of 6   (run-wall max=9.85 min=9.84)
+  detail —
+    eff     : 99%   (ideal wall 9.76s vs 9.86s actual)
+    cpu     : 3.63x of 6  ·  61% CPU / 39% I/O (mixed)  ·  ~2.4 cores idle (2.3 on I/O)
+    lost    : 0.61 worker-s idle  =  bus 0.49s + tail 0.12s
+    balance : by time — counts vary 1.9x, walls within 0% (healthy)  (ran 347–670/w)
+    floor   : 1.40s  tests/…::test_round_trip  ·  3 tests ≥1s, p99 0.36s
+    verdict : 61% CPU/test → your 6 cores sit ~39% idle on I/O; ≈8 workers may overlap
+              that … Try --workers 8 — measure: a shared DB or the E-core tax can cancel it.
+```
+
+- **eff** = parallel efficiency vs the work-conserving ideal (`Σwork/cores`). 99% means the work-stealing scheduler is maxed — better scheduling buys nothing.
+- **cpu** = cores' worth of CPU actually burned. Low `% CPU` means the workers are blocked on I/O (a DB round-trip), so `par.` can look full while cores idle. `~N cores idle` is your headroom.
+- **lost** = the parallelism deficit in absolute worker-seconds, split into bus chatter vs end-of-run straggler drain.
+- **balance** = a big test-*count* spread at near-equal *walls* is **healthy** — work-stealing balances by time, not count.
+- **verdict** = a deterministic worker-count suggestion: keeping the cores busy through I/O waits wants `cores / cpu_sat` workers (Little's-law pool sizing), capped by an E-core discount (workers past the perf cores run on slower E-cores and only hide I/O). It fires only in the clean regime and always says **measure** — a shared external resource or the E-core tax can cancel the gain.
+
+### `--bench[=N]` — *what should I optimize?*
+
+Runs the suite `N` times (default 2; the first is dropped as warmup — more runs steady the ranking and unlock per-test variance), then a **targeted [cProfile](https://docs.python.org/3/library/profile.html) pass over just the top bottleneck tests** adds function-level attribution. It prints a report ranked by reclaimable worker-seconds instead of the run summary:
+
+```text
+  pytest-fast bench  —  3172 tests, 9.06s wall @ 6w  (avg of 3 runs + warmup dropped)
+  best @ 6 cores ≈ 8.73s   ·   floor (longest test) 1.17s  tests/…::test_returns_list
+  where time goes: setup 13% · call 85% · teardown 2%   (of 52s test-wall)
+  per-test wall : p50 0.001s · p90 0.033s · p99 0.291s · max 1.17s
+  ── levers (ranked by reclaimable worker-seconds) ─────────────────
+   1. SHARED SETUP ~  1.6 w-s
+      tests/api/  — 8 tests × ~0.20s setup = 1.6s total
+      → session/module-scope the fixture (if scope-widenable) … [potential]
+   6. MIXED        ~  1.0 w-s
+      tests/migrations/…::test_round_trip  (0.97s: setup 0.00/call 0.97/…, 30% CPU)
+      profile (top by SELF wall — where it's actually burned; ncalls exact):
+         0.834s self    667×  <method 'execute' of 'psycopg2.extensions.cursor'>
+         0.057s self      1×  <method 'executemany' …>
+```
+
+- **best @ cores** = the deterministic floor: you cannot beat `max(Σwork/cores, longest-test)` no matter the worker count.
+- **levers** = each is *(measured number → fixed rule → reclaimable worker-seconds)*, ranked by impact:
+  - **SHARED SETUP** — K tests in one file each paying ~S setup is `K·S` worker-seconds; a session/module-scoped fixture pays it once. Flagged `[potential]` — scope-widenability can't be read from timings, only the upper bound.
+  - **per-test hot-spots** — the slowest calls, classified I/O-BOUND / CPU-BOUND / SETUP-HEAVY by `cpu/total`. The tip states only what the timings determine; it never guesses the cause.
+- **profile** rows (on the top tests) are the leaves where wall is actually burned, by **self** time, with **exact** call counts — `667× execute` in one test is a *measured* N+1 / hot-call signal, not a guess. cProfile is stdlib (no dependency), and its overhead is paid only on the handful of tests that hold the wall.
+- **unstable timing** — with ≥2 measured runs (`--bench=3+`), per-test coefficient of variation flags flaky/contended timings.
 
 ---
 
@@ -300,6 +361,11 @@ pytest --fast                # or: pytest-fast --address /tmp/myapp.sock --worke
 --workers N          Parallel worker count (or $PYTEST_FAST_WORKERS; default: performance cores, >= 1)
 --start-method M     spawn / forkserver / fork (default forkserver)
 --full-report        Ship full per-phase reports → a real --durations table in the summary
+--detailed           Extended parallelism diagnostics block (eff, CPU-vs-I/O, lost-time,
+                     load balance, a deterministic worker-count hint) — see "Performance diagnostics"
+--bench[=N]          Run N times (default 2; first dropped as warmup) → a deterministic bottleneck
+                     report (shared-setup clusters, slowest CPU/IO calls + cProfile attribution,
+                     the wall ceiling) instead of the run summary — what to optimize to go faster
 --with-watcher       Spawn a pre-warm watcher alongside the daemon
 --print-inferred-workers  Print the resolved worker count and exit (honors --workers /
                      $PYTEST_FAST_WORKERS / perf-core auto-detect) — for external tooling
