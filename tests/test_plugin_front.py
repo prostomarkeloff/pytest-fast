@@ -121,6 +121,30 @@ def test_fast_watch_spawns_a_watcher(fast_env: tuple[Path, str]) -> None:
     assert watcher_log.exists(), "--fast-watch did not spawn a watcher (no watcher log)"
 
 
+def test_fast_zero_workers_fails_loudly_not_false_green(fast_env: tuple[Path, str]) -> None:
+    """Regression: `--fast --fast-workers 0` must refuse the session, NOT spawn a 0-worker
+    daemon that runs nothing and exits green (the F2 false-green, previously unguarded on the
+    plugin path — only the CLI runner checked `< 1`). It surfaces as a clean pytest UsageError."""
+    project, address = fast_env
+    env = os.environ.copy()
+    env["PYTEST_FAST_ROOT"] = str(project)
+    env.pop("_PYTEST_FAST_COLLECT", None)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "--fast", "--fast-address", address, "--fast-workers", "0"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"--fast-workers 0 must not exit green.\n{out}"
+    assert ">= 1" in out, f"expected a clear 'must be >= 1' usage error.\n{out}"
+    # the suite has a failing test; a false-green would print a passing summary — it must not.
+    assert "passed" not in out, f"0 workers ran the suite to a green result (false green).\n{out}"
+
+
 def test_plugin_inert_without_fast_flag(tmp_project: Path) -> None:
     """The auto-loaded plugin (pytest11 entry point) must be INERT without --fast: plain
     `pytest` runs the suite in-process as usual and spawns no daemon."""

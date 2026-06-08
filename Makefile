@@ -78,9 +78,13 @@ fuzz-seeds:
 # New units are written to the gitignored scratch dir (first corpus arg); fuzz/corpus is
 # read-only seeds, so it stays curated. Both are read for coverage.
 FUZZ_TIME ?= 120
+# `--no-sync`: atheris was `uv pip install`ed ad-hoc (not a locked dep). A bare `uv run`
+# re-reconciles the env against `.python-version`; if the venv was built on a different
+# interpreter it gets torn down and rebuilt, dropping atheris. `--no-sync` uses the
+# existing venv as-is (run `make fuzz-install` first to put atheris there).
 fuzz: fuzz-seeds
 	@mkdir -p fuzz/corpus-work
-	$(UV) run python fuzz/fuzz_wire.py -max_total_time=$(FUZZ_TIME) -rss_limit_mb=2048 fuzz/corpus-work fuzz/corpus
+	$(UV) run --no-sync python fuzz/fuzz_wire.py -max_total_time=$(FUZZ_TIME) -rss_limit_mb=2048 fuzz/corpus-work fuzz/corpus
 
 # Remove pyc/__pycache__ and the resident socket (next test-full will spawn a fresh daemon).
 clean:
