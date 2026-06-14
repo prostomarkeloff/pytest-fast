@@ -66,9 +66,12 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, Protocol, TypedDict, cast
+
+import pluggy
 
 if TYPE_CHECKING:
     import cProfile
@@ -80,6 +83,14 @@ if TYPE_CHECKING:
     from _pytest.main import Session
     from _pytest.nodes import Item
     from _pytest.reports import TestReport
+
+    class _WorkerConfig(Protocol):
+        """The xdist-style worker attributes we graft onto a configured `Config` post-fork.
+        pytest's `Config` doesn't declare these (xdist adds them dynamically); casting to this
+        Protocol lets us set them without a `# type: ignore`, matching this module's cast convention."""
+
+        workerinput: dict[str, object]
+        workeroutput: dict[str, object]
 
 
 # Public API. Everything with a `_` prefix is an implementation detail (NOT covered by
@@ -993,8 +1004,80 @@ def _worker_hang_timeout() -> float:
         return 0.0
 
 
+def _worker_identity_enabled() -> bool:
+    """Whether the OPT-IN per-worker xdist-identity feature is active.
+
+    Off by default — most suites don't need it and it adds per-worker setup cost. No third-party
+    dependency (not even pytest-xdist): it sets the standard ``PYTEST_XDIST_*`` env + a
+    ``config.workerinput`` dict (plain process state) and fires pytest-fast's own
+    ``pytest_fast_configure_worker`` hook, which an adapter implements to do the per-worker resource
+    setup. Turn it on with ``pytest-fast --worker-identity`` / ``pytest --fast --fast-worker-identity``
+    (both set this env), or directly via ``PYTEST_FAST_WORKER_IDENTITY=1``. Only matters for suites
+    whose plugins isolate per-worker resources (SQLAlchemy follower DBs, pytest-django test DBs, ...)."""
+    return os.environ.get("PYTEST_FAST_WORKER_IDENTITY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _setup_worker_identity(config: Config, wid: int, num_workers: int, testrunuid: str) -> None:
+    """Give this forked worker an xdist-compatible identity plus a per-worker setup hook, so plugins
+    that isolate per-worker resources (SQLAlchemy follower DBs, pytest-django test DBs, ...) don't
+    collide on the controller's single shared default.
+
+    Why it's needed: xdist spawns a FRESH worker process whose ``pytest_configure`` runs with
+    ``config.workerinput`` already set, so worker-aware plugins self-isolate. pytest-fast instead
+    collects+configures ONCE in the forkserver parent (no worker identity) and forks workers — so
+    those plugins never saw a worker id and every worker shares the controller's defaults (e.g.
+    SQLAlchemy's ``FOLLOWER_IDENT=None`` → every worker ATTACHes the same ``*_test_schema.db``).
+
+    Reconstructed post-fork:
+      1. set the standard ``PYTEST_XDIST_*`` env + a ``config.workerinput`` dict — enough on its own
+         for plugins that key per-worker resources off ``PYTEST_XDIST_WORKER`` (e.g. pytest-django);
+      2. fire ``pytest_fast_configure_worker(config, workerid, workercount)`` so an adapter can finish
+         the worker-role setup the fork can't infer — notably re-binding resources a plugin pinned at
+         COLLECTION time in the parent (e.g. SQLAlchemy rebuilds each ``Config``'s engine onto a
+         per-worker follower). A plugin/conftest opts in by defining that hook; pytest-fast ships none.
+
+    Needs no third-party dependency (not even pytest-xdist) — the env + workerinput are plain process
+    state and the hook is pytest-fast's own. Opt-in (see `_worker_identity_enabled`), fully
+    best-effort and guarded — any failure leaves the worker as it was (shared identity), never worse.
+    """
+    if not _worker_identity_enabled() or num_workers <= 1 or hasattr(config, "workerinput"):
+        return
+
+    workerid = f"gw{wid}"
+    workerinput: dict[str, object] = {
+        "workerid": workerid,
+        "workercount": num_workers,
+        "testrunuid": testrunuid,
+        "mainargv": list(sys.argv) or ["pytest"],
+        "option_dict": {},
+    }
+    os.environ["PYTEST_XDIST_WORKER"] = workerid
+    os.environ["PYTEST_XDIST_WORKER_COUNT"] = str(num_workers)
+    os.environ["PYTEST_XDIST_TESTRUNUID"] = testrunuid
+
+    wconfig = cast("_WorkerConfig", config)
+    wconfig.workerinput = workerinput
+    wconfig.workeroutput = {}
+
+    # Fire pytest-fast's own per-worker hook so adapters finish the worker-role setup the fork can't
+    # infer — rebinding resources a plugin pinned at COLLECTION time in the parent (e.g. SQLAlchemy
+    # rebuilds each Config's engine onto a per-worker follower). Registered as a real hookspec in
+    # pytest_addhooks; impls read the now-populated config.workerinput / PYTEST_XDIST_* env. No xdist
+    # involved — the env + workerinput above are plain process state, and this hook is pytest-fast's own.
+    try:
+        config.hook.pytest_fast_configure_worker(config=config, workerid=workerid, workercount=num_workers)
+    except Exception as exc:
+        _log("worker", f"{workerid}: pytest_fast_configure_worker hook failed: {exc!r}")
+
+
 def _worker_main(
-    wid: int, sock_path: str, full_report: bool = False, send_nodeids: bool = False, profile: bool = False
+    wid: int,
+    sock_path: str,
+    full_report: bool = False,
+    send_nodeids: bool = False,
+    profile: bool = False,
+    num_workers: int = 1,
+    testrunuid: str = "",
 ) -> None:
     # IMPORTANT: read globals via `import pytest_fast`, NOT as bare names. `_collect()`
     # set them on the PRELOADED "pytest_fast" module (forkserver) / at import (spawn),
@@ -1007,6 +1090,10 @@ def _worker_main(
     items = pytest_fast.collected_items
     collector = _ReportCollector()
     config.pluginmanager.register(collector)
+    # Graft an xdist-compatible per-worker identity so worker-aware plugins (SQLAlchemy follower DBs,
+    # pytest-django, ...) isolate their resources instead of colliding on the controller's defaults.
+    # Must run before any item executes (provisions the per-worker DB). No-op for a single worker.
+    _setup_worker_identity(config, wid, num_workers, testrunuid)
     collect_wall = time.perf_counter() - t_start
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1351,9 +1438,14 @@ class Daemon:
         server.listen(self.num_workers)
 
         send_nodeids = selection is not None
+        # One run id shared by every worker in this run (xdist's PYTEST_XDIST_TESTRUNUID semantics);
+        # per-worker isolation comes from the distinct workerid, not this.
+        testrunuid = uuid.uuid4().hex
         procs = [
             self.ctx.Process(
-                target=_worker_main, args=(wid, sock_path, full_report, send_nodeids, profile), daemon=True
+                target=_worker_main,
+                args=(wid, sock_path, full_report, send_nodeids, profile, self.num_workers, testrunuid),
+                daemon=True,
             )
             for wid in range(self.num_workers)
         ]
@@ -1853,6 +1945,7 @@ _FINGERPRINT_KEYS = (
     "PYTEST_FAST_WATCH_FILES",
     "PYTEST_FAST_ROOT",
     "PYTEST_FAST_ENV_PREFIXES",  # change in the prefix list itself must respawn too
+    "PYTEST_FAST_WORKER_IDENTITY",  # opt-in per-worker xdist identity changes worker setup → respawn
 )
 
 
@@ -2346,6 +2439,31 @@ def _resolve_fast_address(cli_value: str | None) -> str:
     return cli_value or os.environ.get("PYTEST_FAST_ADDRESS") or _default_fast_address()
 
 
+_pytest_fast_hookspec = pluggy.HookspecMarker("pytest")
+
+
+class _PytestFastHookSpecs:
+    """pytest-fast's own hookspecs (registered via :func:`pytest_addhooks`)."""
+
+    @_pytest_fast_hookspec
+    def pytest_fast_configure_worker(self, config: Config, workerid: str, workercount: int) -> None:
+        """Fired once per forked worker — post-fork, before any test runs — when the opt-in
+        ``--worker-identity`` feature is active, AFTER the worker's xdist-style identity
+        (``PYTEST_XDIST_WORKER`` + ``config.workerinput``) is in place.
+
+        Implement it in a plugin/conftest to (re)initialize per-worker resources the fork can't
+        infer — e.g. rebind a SQLAlchemy engine onto a per-worker follower database. ``config``
+        carries the populated ``config.workerinput``; ``workerid`` / ``workercount`` mirror
+        ``PYTEST_XDIST_WORKER`` / ``PYTEST_XDIST_WORKER_COUNT``."""
+
+
+def pytest_addhooks(pluginmanager: pluggy.PluginManager) -> None:
+    """Register pytest-fast's own hookspecs so plugins may implement ``pytest_fast_configure_worker``
+    without a ``PluginValidationError``. Always registered (cheap); the hook only FIRES under
+    ``--worker-identity``."""
+    pluginmanager.add_hookspecs(_PytestFastHookSpecs)
+
+
 def pytest_addoption(parser: Parser) -> None:
     group = parser.getgroup("pytest-fast", "resident forkserver accelerator")
     group.addoption(
@@ -2379,6 +2497,14 @@ def pytest_addoption(parser: Parser) -> None:
         default=False,
         help="also keep a background watcher pre-warming the daemon on source changes",
     )
+    group.addoption(
+        "--fast-worker-identity",
+        action="store_true",
+        default=False,
+        help="OPT-IN: give each --fast worker an xdist-compatible identity + fire "
+        "pytest_fast_configure_worker (per-worker resource isolation for SQLAlchemy/pytest-django/...). "
+        "No extra deps. Equivalent to $PYTEST_FAST_WORKER_IDENTITY=1",
+    )
 
 
 def pytest_runtestloop(session: Session) -> bool | None:
@@ -2388,6 +2514,9 @@ def pytest_runtestloop(session: Session) -> bool | None:
     config = session.config
     if not config.getoption("fast", default=False):
         return None
+    if config.getoption("fast_worker_identity", default=False):
+        # Propagate the opt-in to the daemon (env-inherited by its forked workers) before we ensure it.
+        os.environ["PYTEST_FAST_WORKER_IDENTITY"] = "1"
     if session.testsfailed and not config.getvalue("continue_on_collection_errors"):
         raise session.Interrupted(f"{session.testsfailed} error(s) during collection")
 
@@ -2635,6 +2764,14 @@ def main(argv: list[str]) -> int:
         "pool to match the run without importing pytest-fast internals",
     )
     parser.add_argument("--start-method", choices=["spawn", "forkserver", "fork"], default="forkserver")
+    parser.add_argument(
+        "--worker-identity",
+        action="store_true",
+        help="OPT-IN: give each forked worker an xdist-style identity (PYTEST_XDIST_WORKER + "
+        "config.workerinput) and fire the pytest_fast_configure_worker hook, so an adapter can isolate "
+        "per-worker resources (SQLAlchemy follower DBs, pytest-django, ...). No third-party deps. "
+        "Equivalent to $PYTEST_FAST_WORKER_IDENTITY=1",
+    )
     parser.add_argument("--address", help="unix socket of the resident daemon (or $PYTEST_FAST_ADDRESS)")
     parser.add_argument(
         "--ttl", type=float, default=None, help="serve/ensure: idle seconds before self-shutdown (or $PYTEST_FAST_TTL)"
@@ -2673,6 +2810,10 @@ def main(argv: list[str]) -> int:
         "CPU/IO calls, the wall ceiling — what to optimize to go faster. More runs → steadier ranking",
     )
     ns = parser.parse_args(argv)
+    if ns.worker_identity:
+        # Propagate to the (possibly subprocess) daemon + its forked workers via env, and make it part
+        # of the daemon's env fingerprint so toggling it respawns a stale warm daemon.
+        os.environ["PYTEST_FAST_WORKER_IDENTITY"] = "1"
     try:
         workers = _resolve_workers(ns.workers)
     except ValueError as exc:
