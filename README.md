@@ -27,7 +27,7 @@ Two ways to drive it, one warm engine underneath:
 > **Rule of thumb:** reach for **`pytest-fast --address`** by default (tight loops, CI, anything where you re-run constantly). Use **`pytest --fast` only when you actually need native reporting** — `--junitxml`, native `-v`, third-party report plugins — and can eat the per-run controller-side cold start. (It's still far faster than cold `xdist`, which re-pays that import *N* times; it's just nowhere near the CLI.)
 
 ```bash
-uv add git+https://github.com/prostomarkeloff/pytest-fast.git
+uv add pytest-fast
 ```
 
 ```bash
