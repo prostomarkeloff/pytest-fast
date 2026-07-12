@@ -67,7 +67,8 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
@@ -157,6 +158,19 @@ class _RunOutcome(NamedTuple):
     total: int
     idx: int
     exitcodes: list[int | None]
+
+
+class _PersistPool(NamedTuple):
+    """A warm worker pool held across serve `run` requests (opt-in ``--persist-workers``). Workers are
+    forked ONCE; each holds a long-lived pytest session, so a session-scoped fixture set up once is
+    reused for every request. ``total``/``nodeids`` come from the workers' one-time 'ready' frame."""
+
+    server: socket.socket
+    sock_path: str
+    procs: list[BaseProcess]
+    conns: list[socket.socket]
+    total: int
+    nodeids: list[str] | None
 
 
 class ParMetrics(TypedDict):
@@ -1190,6 +1204,107 @@ def _worker_main(
     os._exit(0)
 
 
+def _worker_persist_main(
+    wid: int,
+    pool_sock_path: str,
+    *,
+    send_nodeids: bool = False,
+    num_workers: int = 1,
+    testrunuid: str = "",
+) -> None:
+    """Persist-mode worker (opt-in `--persist-workers`, serve mode): forked ONCE, its pytest session
+    spans MANY run requests. Between runs the session — and its session-scoped fixtures — stays alive:
+    at each run's end the last item tears down against a session-sharing ``anchor`` item (never
+    ``nextitem=None``), so pytest keeps session-scoped fixtures. Only at ``stop`` (daemon shutdown)
+    does the final item tear down with ``nextitem=None`` (full session teardown), then the worker exits.
+
+    Per-run protocol over the pool socket: the master answers the worker's ``('req', result)`` with
+    ``('idx', pick)`` to run the next item, ``('flush',)`` once the run's queue is drained, or
+    ``('stop',)`` at shutdown. The worker replies ``('run_done', wid, stats)`` at each run boundary and
+    stays warm. The one-item lag (a result ships on the NEXT req) is preserved; ``flush`` runs the held
+    last item against the anchor and ships its result before ``run_done``."""
+    t_start = time.perf_counter()
+    import pytest_fast
+
+    config = pytest_fast.collected_config
+    assert config is not None, "forkserver/spawn must have collected tests before worker start"
+    items = pytest_fast.collected_items
+    collector = _ReportCollector()
+    config.pluginmanager.register(collector)
+    _setup_worker_identity(config, wid, num_workers, testrunuid)
+    collect_wall = time.perf_counter() - t_start
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(pool_sock_path)
+    anchor = items[0] if items else None  # any collected item shares session scope → keeps session fixtures alive
+    ready_nodeids = [it.nodeid for it in items] if send_nodeids else None
+    _send(sock, ("ready", wid, len(items), collect_wall, ready_nodeids))
+
+    stop = False
+    while not stop:  # spans runs — session persists across this outer loop
+        prev: Item | None = None
+        pending: RunResult | None = None
+        ran = 0
+        busy = 0.0
+        run_start = time.perf_counter()
+        while True:  # one run
+            _send(sock, ("req", wid, pending))
+            reply, _ = _recv(sock)
+            if not isinstance(reply, tuple) or not reply:
+                stop = True  # master gone → shut this worker down (final teardown below)
+                break
+            tag = reply[0]
+            if tag == "stop":
+                stop = True
+                break
+            if tag == "flush":
+                if prev is not None:
+                    t0 = time.perf_counter()
+                    # nextitem keeps the SESSION alive across runs, but MUST differ from prev — else pytest
+                    # keeps prev's function-scoped fixtures (nextitem still needs them) and the next re-run of
+                    # prev can't re-inject them (KeyError). anchor=items[0] normally; opposite end if prev IS it.
+                    nxt = anchor if anchor is not prev else next((it for it in reversed(items) if it is not prev), None)
+                    pending = _run_one_item(prev, nxt, collector, full_report=True)
+                    busy += time.perf_counter() - t0
+                    ran += 1
+                    _send(sock, ("req", wid, pending))  # ship the run's last result
+                stats: WorkerStats = {
+                    "wid": wid,
+                    "ran": ran,
+                    "busy": busy,
+                    "cpu": 0.0,
+                    "bus_wait": 0.0,
+                    "run_wall": time.perf_counter() - run_start,
+                }
+                _send(sock, ("run_done", wid, stats))
+                break  # wait for the next run; session (and session fixtures) stays warm
+            idx = reply[1]  # ('idx', pick)
+            cur = items[idx] if isinstance(idx, int) and 0 <= idx < len(items) else None
+            if prev is not None:
+                t0 = time.perf_counter()
+                pending = _run_one_item(prev, cur, collector, full_report=True)
+                busy += time.perf_counter() - t0
+                ran += 1
+            else:
+                pending = None
+            prev = cur
+    # Daemon shutdown: finalize the long-lived session (its session-scoped fixtures persisted across all
+    # runs via the anchor). At a run boundary `prev` is already run+shipped, so there's no item to tear
+    # down against None — drain the session's setup-state directly (parity with the per-run path, whose
+    # last item tears down with nextitem=None every run). A held-but-unrun `prev` (master died mid-run)
+    # tears down normally. Best-effort: we're exiting, so a finalizer error must not wedge shutdown.
+    if prev is not None:
+        with suppress(Exception):
+            _run_one_item(prev, None, collector)
+    elif anchor is not None:
+        with suppress(Exception):
+            anchor.session._setupstate.teardown_exact(None)  # finalize session-scoped fixtures
+    with suppress(OSError):
+        _send(sock, ("bye", wid))
+    sock.close()
+    os._exit(0)
+
+
 # ── reference outcome-dump (when loaded as `-p pytest_fast` with OUTCOME_DUMP) ─
 #
 # Under xdist the controller re-publishes worker reports → its hook sees ALL tests.
@@ -1217,7 +1332,9 @@ def pytest_sessionfinish(session: object) -> None:
 
 
 class Daemon:
-    def __init__(self, num_workers: int, start_method: str, dump_path: str | None = None) -> None:
+    def __init__(
+        self, num_workers: int, start_method: str, dump_path: str | None = None, *, persist_workers: bool = False
+    ) -> None:
         super().__init__()
         # Real raise, not `assert` — this is a safety invariant (0 workers → nothing runs →
         # silent green), and `assert` is stripped under `python -O`. Entry points reject `< 1`
@@ -1228,6 +1345,7 @@ class Daemon:
         self.num_workers = num_workers
         self.start_method = start_method
         self.dump_path = dump_path
+        self.persist_workers = persist_workers
         # Context + preload are created ONCE; the forkserver lazy-spawns on the first
         # Process.start() and collects tests there, subsequent forks reuse the ready items.
         # get_context(str) in typeshed → BaseContext (no .Process); at runtime the context
@@ -1253,11 +1371,24 @@ class Daemon:
 
     # ── public modes ─────────────────────────────────────────────────────────
 
-    def run(self, runs: int, *, full_report: bool = False, detailed: bool = False, bench: int = 0) -> int:
+    def run(
+        self,
+        runs: int,
+        *,
+        full_report: bool = False,
+        detailed: bool = False,
+        bench: int = 0,
+        persist_workers: bool = False,
+    ) -> int:
         """Local mode: single-shot (runs=1) or N runs in one process. `bench=N` is its own N-run
-        loop (warmup dropped) → one bottleneck report; it ignores `runs`."""
+        loop (warmup dropped) → one bottleneck report; it ignores `runs`. `persist_workers` reuses one
+        warm worker across the N runs (session fixtures set up once)."""
         if bench > 0:
             rc, summary = self._run_bench(bench)
+            print(summary)
+            return rc
+        if persist_workers:
+            rc, summary = self._run_persistent(runs, full_report=full_report, detailed=detailed)
             print(summary)
             return rc
         rc = 0
@@ -1265,6 +1396,201 @@ class Daemon:
             rc, summary = self._run_once(full_report=full_report, detailed=detailed)
             print(summary)
         return rc
+
+    def _run_persistent(self, runs: int, *, full_report: bool, detailed: bool) -> tuple[int, str]:
+        """Persist mode: spawn the warm pool ONCE, dispatch the suite `runs` times through it (each
+        worker's session — and its session-scoped fixtures — set up once and reused for every run), tear
+        down. Same robust pool + anchor path as serve mode: each run dispatches the suite ONCE, so no
+        worker re-runs the same item back-to-back. The default per-run fork (`_run_once`) re-pays session
+        setup every run; this amortizes it."""
+        pool = self._spawn_persist_pool(send_nodeids=False)
+        try:
+            rc = 0
+            summaries: list[str] = []
+            for _ in range(max(1, runs)):
+                run_rc, summary = self._run_persist_request(
+                    pool,
+                    selection=None,
+                    progress_conn=None,
+                    report_conn=None,
+                    full_report=full_report,
+                    detailed=detailed,
+                )
+                rc = rc or run_rc
+                summaries.append(summary)
+            return rc, "\n\n".join(summaries)
+        finally:
+            self._teardown_persist_pool(pool)
+
+    # ── persistent worker pool (serve --persist-workers) ─────────────────────
+    def _spawn_persist_pool(self, *, send_nodeids: bool) -> _PersistPool:
+        """Fork the warm worker pool ONCE (serve persist mode): each worker holds a long-lived pytest
+        session. Binds a stable pool socket, starts the workers, and captures their one-time 'ready'
+        (item count +, in selection mode, the collected nodeids used to resolve a request's selection)."""
+        sock_path = f"{tempfile.gettempdir()}/pytest_fast_persist_{os.getpid()}.sock"
+        Path(sock_path).unlink(missing_ok=True)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(sock_path)
+        server.listen(self.num_workers)
+        testrunuid = uuid.uuid4().hex
+        procs: list[BaseProcess] = [
+            self.ctx.Process(
+                target=_worker_persist_main,
+                args=(wid, sock_path),
+                kwargs={"send_nodeids": send_nodeids, "num_workers": self.num_workers, "testrunuid": testrunuid},
+                daemon=True,
+            )
+            for wid in range(self.num_workers)
+        ]
+        self._arm_collect_flag()
+        for p in procs:
+            p.start()
+        conns: list[socket.socket] = []
+        total = 0
+        nodeids: list[str] | None = None
+        server.settimeout(_WORKER_ACCEPT_TIMEOUT)
+        for _ in range(self.num_workers):
+            conn, _addr = server.accept()
+            msg, _ = _recv(conn)  # ('ready', wid, count, collect_wall, nodeids)
+            conns.append(conn)
+            if isinstance(msg, tuple) and len(msg) >= 5 and msg[0] == "ready":
+                total = cast("int", msg[2])
+                if send_nodeids and isinstance(msg[4], list):
+                    nodeids = cast("list[str]", msg[4])
+        server.settimeout(None)
+        return _PersistPool(server=server, sock_path=sock_path, procs=procs, conns=conns, total=total, nodeids=nodeids)
+
+    def _dispatch_persist(
+        self,
+        pool: _PersistPool,
+        *,
+        selection: list[str] | None,
+        progress_conn: socket.socket | None,
+        report_conn: socket.socket | None,
+    ) -> _RunOutcome:
+        """One run over the WARM pool: hand each worker item indices (work-stealing), send 'flush' when
+        the queue drains, stream reports, collect results + per-run stats. Workers stay alive after
+        'run_done' (session warm). The one-item lag means a worker's last result arrives post-'flush'."""
+        t0 = time.perf_counter()
+        pick_list: list[int] | None = None
+        if selection is not None and pool.nodeids is not None:
+            idx_of = {nid: i for i, nid in enumerate(pool.nodeids)}
+            pick_list = [idx_of[n] for n in selection if n in idx_of]
+        total = len(pick_list) if pick_list is not None else pool.total
+        results: list[RunResult] = []
+        worker_stats: list[WorkerStats] = []
+        flushed: set[socket.socket] = set()
+        done: set[socket.socket] = set()
+        queue_pos = 0
+        tx = rx = req_count = 0
+        sel = selectors.DefaultSelector()
+        for conn in pool.conns:
+            sel.register(conn, selectors.EVENT_READ)
+        t_ready = time.perf_counter()
+        try:
+            while len(done) < len(pool.conns):
+                for key, _mask in sel.select():
+                    conn = cast("socket.socket", key.fileobj)
+                    msg, nbytes = _recv(conn)
+                    rx += nbytes
+                    if not isinstance(msg, tuple) or not msg:
+                        done.add(conn)  # worker died → result undercount flags the run untrusted
+                        sel.unregister(conn)
+                        continue
+                    parts = cast("tuple[object, ...]", msg)
+                    kind = parts[0]
+                    if kind == "run_done":
+                        worker_stats.append(cast("WorkerStats", parts[2]))
+                        done.add(conn)
+                        sel.unregister(conn)
+                        continue
+                    req_count += 1
+                    # kind == "req": ship any carried result, then hand out the next index or 'flush'
+                    result = cast("RunResult | None", parts[2])
+                    if result is not None:
+                        results.append(result)
+                        if progress_conn is not None:
+                            with suppress(OSError):
+                                _send(progress_conn, {"progress": (len(results), total)})
+                        if report_conn is not None:
+                            for rep in result.get("reports", []):
+                                with suppress(OSError):
+                                    _send(report_conn, {"report": rep})
+                    if conn in flushed:
+                        continue  # post-flush last result already shipped; just await run_done
+                    if pick_list is not None:
+                        pick = pick_list[queue_pos] if queue_pos < len(pick_list) else None
+                    else:
+                        pick = queue_pos if total > 0 and queue_pos < total else None
+                    if pick is not None:
+                        queue_pos += 1
+                        tx += _send(conn, ("idx", pick))
+                    else:
+                        tx += _send(conn, ("flush",))
+                        flushed.add(conn)
+        finally:
+            sel.close()
+        t_done = time.perf_counter()
+        # Workers stay ALIVE (persist) → exitcode None → never 'crashed'; a died worker undercounts results.
+        exitcodes = [p.exitcode for p in pool.procs]
+        return _RunOutcome(
+            results=results,
+            worker_stats=worker_stats,
+            bus={"tx": float(tx), "rx": float(rx), "req_count": float(req_count)},
+            warmup=t_ready - t0,
+            run_wall=t_done - t_ready,
+            total=total,
+            idx=1,
+            exitcodes=exitcodes,
+        )
+
+    def _run_persist_request(
+        self,
+        pool: _PersistPool,
+        *,
+        selection: list[str] | None,
+        progress_conn: socket.socket | None,
+        report_conn: socket.socket | None,
+        full_report: bool,
+        detailed: bool,
+    ) -> tuple[int, str]:
+        """Serve a single `run` request against the warm pool, render its summary (workers stay warm)."""
+        o = self._dispatch_persist(pool, selection=selection, progress_conn=progress_conn, report_conn=report_conn)
+        summary = self._report(
+            o.results,
+            o.worker_stats,
+            o.bus,
+            o.total,
+            warmup=o.warmup,
+            run=o.run_wall,
+            label="run (persist, warm session)",
+            full_report=full_report,
+            detailed=detailed,
+        )
+        rc = 1 if any(r["outcome"] in {"failed", "error"} for r in o.results) else 0
+        if self._run_untrusted(o):
+            rc = 1
+            summary += (
+                f"\n  ⚠ UNTRUSTED RUN — worker crashed / result undercount: "
+                f"results={len(o.results)}/{o.total}, worker exitcodes={o.exitcodes} (see daemon log)"
+            )
+        return rc, summary
+
+    def _teardown_persist_pool(self, pool: _PersistPool) -> None:
+        """Stop the warm pool at daemon shutdown: tell each worker to finalize its session and exit."""
+        for conn in pool.conns:
+            with suppress(OSError):
+                _send(conn, ("stop",))
+        for p in pool.procs:
+            p.join(timeout=_WORKER_JOIN_TIMEOUT)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=1.0)
+        for conn in pool.conns:
+            with suppress(OSError):
+                conn.close()
+        pool.server.close()
+        Path(pool.sock_path).unlink(missing_ok=True)
 
     def serve(self, address: str, ttl: float) -> int:
         """Resident daemon. Collect once; idle>ttl → exit; sources changed → stale-exit.
@@ -1296,6 +1622,9 @@ class Daemon:
 
         cur = address  # current listening address — may change via ('promote', …)
         ctl = _bind_ctl(cur, ttl)
+        # Warm worker pool for --persist-workers: forked lazily on the first run and reused across all
+        # requests (session-scoped fixtures set up once). None in the default per-run-fork mode.
+        pool: _PersistPool | None = None
         try:
             while True:
                 try:
@@ -1389,7 +1718,30 @@ class Daemon:
                     # irrelevant in stream mode (the plugin controller renders natively).
                     detailed = len(fp_args) > 4 and bool(fp_args[4])
                     bench = int(fp_args[5]) if len(fp_args) > 5 and isinstance(fp_args[5], int) else 0
-                    if stream:
+                    if self.persist_workers and bench == 0:
+                        # Warm pool: fork once (lazily), reuse across requests → session fixtures set up
+                        # once. Always capture nodeids so any request's selection resolves to indices.
+                        if pool is None:
+                            pool = self._spawn_persist_pool(send_nodeids=True)
+                        if stream:
+                            rc, summary = self._run_persist_request(
+                                pool,
+                                selection=selection,
+                                progress_conn=None,
+                                report_conn=conn,
+                                full_report=True,
+                                detailed=False,
+                            )
+                        else:
+                            rc, summary = self._run_persist_request(
+                                pool,
+                                selection=selection,
+                                progress_conn=conn,
+                                report_conn=None,
+                                full_report=full_report,
+                                detailed=detailed,
+                            )
+                    elif stream:
                         # Controller renders natively from the streamed reports → no daemon-side
                         # progress frames (progress_conn=None), full reports required.
                         rc, summary = self._run_once(full_report=True, report_conn=conn, selection=selection)
@@ -1407,6 +1759,8 @@ class Daemon:
                         # the daemon does NOT crash (used to crash on BrokenPipe here), stays warm
                         _log("daemon", "client gone before summary; run completed, staying warm")
         finally:
+            if pool is not None:
+                self._teardown_persist_pool(pool)  # stop the warm workers → finalize their sessions
             ctl.close()
             _remove_pid(cur)
             Path(cur).unlink(missing_ok=True)
@@ -2786,6 +3140,12 @@ def main(argv: list[str]) -> int:
         help="ensure a background source watcher pre-warms the daemon on every src/tests change",
     )
     parser.add_argument("--runs", type=int, default=1, help="local single-process mode: number of in-process runs")
+    parser.add_argument(
+        "--persist-workers",
+        action="store_true",
+        help="local mode: reuse one warm worker across --runs (session-scoped fixtures set up ONCE, not "
+        "per run) — opt-in, trades away cross-run isolation for many-small-runs clients",
+    )
     parser.add_argument("--dump", help="local mode: write {nodeid: outcome} JSON (for the outcome-diff harness)")
     parser.add_argument(
         "--full-report",
@@ -2831,7 +3191,9 @@ def main(argv: list[str]) -> int:
     if ns.serve:
         if not address:
             parser.error("--serve requires --address")
-        return Daemon(num_workers=workers, start_method=ns.start_method).serve(address, ttl)
+        return Daemon(num_workers=workers, start_method=ns.start_method, persist_workers=ns.persist_workers).serve(
+            address, ttl
+        )
     if address:
         return _ensure_and_run(
             workers,
@@ -2844,7 +3206,7 @@ def main(argv: list[str]) -> int:
             bench=ns.bench,
         )
     return Daemon(num_workers=workers, start_method=ns.start_method, dump_path=ns.dump).run(
-        ns.runs, full_report=ns.full_report, detailed=ns.detailed, bench=ns.bench
+        ns.runs, full_report=ns.full_report, detailed=ns.detailed, bench=ns.bench, persist_workers=ns.persist_workers
     )
 
 

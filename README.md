@@ -371,9 +371,29 @@ pytest --fast                # or: pytest-fast --address /tmp/myapp.sock --worke
                      $PYTEST_FAST_WORKERS / perf-core auto-detect) — for external tooling
                      sizing a per-worker pool to the run, without importing internals
 --runs N             Local single-process mode (no daemon)
+--persist-workers    Opt-in: reuse a warm worker pool across runs/requests so SESSION-scoped
+                     fixtures are set up once, not re-paid per run. Trades cross-run isolation
+                     for speed — for many-small-runs clients (a mutation tester issuing one run
+                     per mutant, a fuzz loop, a watch-driven re-runner) with an expensive session fixture
 --dump PATH          Local mode: write {nodeid: outcome} JSON
 --serve / --watch    Internal (the daemon / watcher processes spawn themselves with these)
 ```
+
+#### `--persist-workers` — amortize expensive session-scoped fixtures
+
+By default every run forks fresh workers that exit on completion, so a `scope="session"` fixture
+(a DB engine + schema seed, an app factory, a warmed cache) is set up **again on every run** — the
+forkserver amortizes *collect*, not *fixtures*. A client that issues many small runs against the same
+warm daemon (a mutation tester: one `run` per mutant; a fuzz loop; a watch-driven re-runner) re-pays
+that setup every time, and it dominates wall-clock.
+
+`--persist-workers` holds a warm worker pool across runs: each worker is forked once and its pytest
+session spans every run, so session-scoped fixtures are set up **once** and reused. Function- and
+module-scoped fixtures still tear down normally between items (isolation within a run is unchanged);
+what's traded away is **cross-run** isolation — arbitrary global state a test mutates persists to the
+next run — which is why it's opt-in. The saving is the whole session-fixture setup, per run: it scales
+with how expensive that fixture is and how many runs you issue, so it's largest for a long stream of
+small runs against a heavyweight session fixture (a DB engine + schema seed, an app factory).
 
 ---
 
