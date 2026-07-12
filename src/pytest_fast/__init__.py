@@ -1253,11 +1253,24 @@ class Daemon:
 
     # ── public modes ─────────────────────────────────────────────────────────
 
-    def run(self, runs: int, *, full_report: bool = False, detailed: bool = False, bench: int = 0) -> int:
+    def run(
+        self,
+        runs: int,
+        *,
+        full_report: bool = False,
+        detailed: bool = False,
+        bench: int = 0,
+        persist_workers: bool = False,
+    ) -> int:
         """Local mode: single-shot (runs=1) or N runs in one process. `bench=N` is its own N-run
-        loop (warmup dropped) → one bottleneck report; it ignores `runs`."""
+        loop (warmup dropped) → one bottleneck report; it ignores `runs`. `persist_workers` reuses one
+        warm worker across the N runs (session fixtures set up once)."""
         if bench > 0:
             rc, summary = self._run_bench(bench)
+            print(summary)
+            return rc
+        if persist_workers:
+            rc, summary = self._run_persistent(runs, full_report=full_report, detailed=detailed)
             print(summary)
             return rc
         rc = 0
@@ -1265,6 +1278,32 @@ class Daemon:
             rc, summary = self._run_once(full_report=full_report, detailed=detailed)
             print(summary)
         return rc
+
+    def _run_persistent(self, runs: int, *, full_report: bool, detailed: bool) -> tuple[int, str]:
+        """Persist mode: ONE fork feeds the queue `runs` times, so the worker's pytest session spans
+        all runs — `nextitem` stays non-None until the very last item, so pytest never tears down the
+        session between runs and a session-scoped fixture is set up ONCE (not per run). The default
+        per-run fork path (`_run_once`) re-pays that setup every run; this amortizes it."""
+        o = self._execute_run(None, full_report=full_report, report_conn=None, selection=None, repeat=max(1, runs))
+        summary = self._report(
+            o.results,
+            o.worker_stats,
+            o.bus,
+            len(o.results),
+            warmup=o.warmup,
+            run=o.run_wall,
+            label=f"{runs} runs (persist-workers, warm session)",
+            full_report=full_report,
+            detailed=detailed,
+        )
+        rc = 1 if any(r["outcome"] in {"failed", "error"} for r in o.results) else 0
+        if self._run_untrusted(o):
+            rc = 1
+            summary += (
+                f"\n  ⚠ UNTRUSTED RUN — worker crashed / result undercount: "
+                f"results={len(o.results)}, worker exitcodes={o.exitcodes} (see daemon log)"
+            )
+        return rc, summary
 
     def serve(self, address: str, ttl: float) -> int:
         """Resident daemon. Collect once; idle>ttl → exit; sources changed → stale-exit.
@@ -1421,10 +1460,13 @@ class Daemon:
         report_conn: socket.socket | None,
         selection: list[str] | None,
         profile: bool = False,
+        repeat: int = 1,
     ) -> _RunOutcome:
         """One fork→serve→collect cycle. Returns raw results + timing + integrity, NO rendering —
         shared by the single-run `_run_once` and the N-run `_run_bench`. `profile` (the bench
-        targeted pass) makes the workers run each test under cProfile."""
+        targeted pass) makes the workers run each test under cProfile. `repeat` > 1 (persist mode)
+        cycles the full-suite queue that many times through the SAME forked workers, so each worker's
+        session — and its session-scoped fixtures — is set up once and reused across all repeats."""
         idx = self._run_counter
         self._run_counter += 1
         t0 = time.perf_counter()
@@ -1454,7 +1496,9 @@ class Daemon:
             p.start()
 
         try:
-            results, worker_stats, bus, t_ready, total = self._serve_bus(server, progress_conn, report_conn, selection)
+            results, worker_stats, bus, t_ready, total = self._serve_bus(
+                server, progress_conn, report_conn, selection, repeat=repeat
+            )
         finally:
             # Bounded join: a healthy worker exits within milliseconds of sending `fin`
             # (it calls `os._exit(0)`). If join exceeds the budget, the worker is wedged
@@ -1589,6 +1633,8 @@ class Daemon:
         progress_conn: socket.socket | None = None,
         report_conn: socket.socket | None = None,
         selection: list[str] | None = None,
+        *,
+        repeat: int = 1,
     ) -> tuple[list[RunResult], list[WorkerStats], dict[str, float], float, int]:
         # Worker connect with timeout: if a forked worker died BEFORE connect (warmup
         # crash), we don't block in accept() forever — start with whoever made it.
@@ -1624,7 +1670,8 @@ class Daemon:
 
             def emit_progress(*, force: bool = False) -> None:
                 nonlocal progress_conn, last_emit
-                tgt = len(pick_list) if pick_list is not None else total  # how many we actually run
+                # how many we actually run: selection = pick_list; full suite cycled `repeat`× in persist mode
+                tgt = len(pick_list) if pick_list is not None else (total * repeat if total is not None else None)
                 if progress_conn is None or tgt is None:
                     return
                 now = time.perf_counter()
@@ -1687,8 +1734,13 @@ class Daemon:
                             emit_reports(result)
                         if pick_list is not None:
                             pick = pick_list[queue_pos] if queue_pos < len(pick_list) else None
+                        elif total is not None and total > 0 and queue_pos < total * repeat:
+                            # persist mode: cycle the full suite `repeat` times through the SAME worker —
+                            # nextitem stays non-None across cycle boundaries, so the session (and its
+                            # session-scoped fixtures) is set up once and reused for every repeat.
+                            pick = queue_pos % total
                         else:
-                            pick = queue_pos if total is not None and queue_pos < total else None
+                            pick = None
                         if pick is not None:
                             queue_pos += 1
                         try:
@@ -2786,6 +2838,12 @@ def main(argv: list[str]) -> int:
         help="ensure a background source watcher pre-warms the daemon on every src/tests change",
     )
     parser.add_argument("--runs", type=int, default=1, help="local single-process mode: number of in-process runs")
+    parser.add_argument(
+        "--persist-workers",
+        action="store_true",
+        help="local mode: reuse one warm worker across --runs (session-scoped fixtures set up ONCE, not "
+        "per run) — opt-in, trades away cross-run isolation for many-small-runs clients",
+    )
     parser.add_argument("--dump", help="local mode: write {nodeid: outcome} JSON (for the outcome-diff harness)")
     parser.add_argument(
         "--full-report",
@@ -2844,7 +2902,7 @@ def main(argv: list[str]) -> int:
             bench=ns.bench,
         )
     return Daemon(num_workers=workers, start_method=ns.start_method, dump_path=ns.dump).run(
-        ns.runs, full_report=ns.full_report, detailed=ns.detailed, bench=ns.bench
+        ns.runs, full_report=ns.full_report, detailed=ns.detailed, bench=ns.bench, persist_workers=ns.persist_workers
     )
 
 

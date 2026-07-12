@@ -78,3 +78,18 @@ def test_session_fixture_reset_up_once_per_run(tmp_path: Path) -> None:
 
     setups = counter.read_text().count("setup") if counter.exists() else 0
     assert setups == 3, f"expected one session-fixture setup per run (3), got {setups}"
+
+
+def test_persist_workers_amortizes_session_fixture(tmp_path: Path) -> None:
+    """Opt-in `--persist-workers`: the N runs reuse one warm worker whose pytest session spans them,
+    so a session-scoped fixture is set up ONCE across all runs (not once per run). This is the whole
+    point — amortize the expensive session setup that the default per-run fork re-pays every time."""
+    project, counter = tmp_path / "proj", tmp_path / "setups.txt"
+    project.mkdir()
+    _make_project(project, counter)
+
+    proc = _run(project, "--runs", "3", "--persist-workers")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    setups = counter.read_text().count("setup") if counter.exists() else 0
+    assert setups == 1, f"--persist-workers should set up the session fixture once, got {setups}"
