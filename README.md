@@ -421,25 +421,40 @@ Fired once per test in the worker (hot path — keep it cheap). Exceptions degra
 the daemon log, never a failed test. Per-test **CPU time is already built in**: every lean run ships
 `result["cpu"]` (`duration − cpu ≈ I/O wait`) — no plugin needed.
 
-### Daemon seam — sections inside the summary box
+### Daemon seam — the summary is yours (block design)
 
 The daemon holds every run's aggregated data but (by architecture) no pytest session — collection
 lives in the forkserver preload. So daemon-side extensions are **plain modules**, named in
-`PYTEST_FAST_DAEMON_PLUGINS` (comma-separated import paths):
+`PYTEST_FAST_DAEMON_PLUGINS` (comma-separated import paths). The summary box is rendered as a list
+of **named blocks** — `top`, `results`, `warmup`, `run`, `par`, [`detailed`], `bus`, [`failures`],
+[`xpass`], [`durations` (full-report) | `slowest` (lean)], `bottom` — and a plugin may implement the
+additive hook, the full-control hook, or both:
 
 ```python
 # myproj/timing_gate.py
+
 def pytest_fast_run_completed(run_info):
+    """Additive: returned lines become a `plugin:<mod>` block right after the stats block."""
     slow = [r for r in run_info["results"] if r["duration"] > 5.0]
-    return [f"  ⏱ my-gate: {len(slow)} slow tests"]  # spliced into the box after the stats block
+    return [f"  ⏱ my-gate: {len(slow)} slow tests"]
+
+def pytest_fast_render_summary(run_info, blocks):
+    """Full control: reorder, drop, rewrite, inject — the returned list IS the summary."""
+    by_name = {b["name"]: b for b in blocks}
+    by_name["top"]["lines"][1] = "  ⚡ MY SUITE — custom header"
+    order = ["top", "results", "run", "plugin:myproj.timing_gate", "slowest", "bottom"]
+    return [by_name[n] for n in order if n in by_name]
 ```
 
-`run_info` keys: `results` (list of `RunResult` — nodeid/outcome/duration/cpu/extra/…),
-`worker_stats`, `bus`, `total`, `warmup`, `run_wall`, `num_workers`, `start_method`, `label`.
-Failure policy: import errors / missing symbol / raising plugins become a visible `⚠` line in the
-summary — never a crashed daemon, never a silently-missing gate. The env var participates in the
-staleness fingerprint (changing the list respawns the warm daemon); keep plugin **code** under the
-watched dirs (`PYTEST_FAST_WATCH_DIRS`) so editing it respawns too.
+Plugins run in env-list order, each `render_summary` seeing the previous one's output (a pipeline);
+returning `None` keeps the (possibly mutated in place) layout. `run_info` keys: `results` (list of
+`RunResult` — nodeid/outcome/duration/cpu/extra/…), `worker_stats`, `bus`, `total`, `warmup`,
+`run_wall`, `num_workers`, `start_method`, `label`.
+
+Failure policy: import errors / missing hooks / raising plugins / malformed render returns become a
+visible `⚠` line in a `plugin-errors` block — never a crashed daemon, never a silently-missing gate.
+The env var participates in the staleness fingerprint (changing the list respawns the warm daemon);
+keep plugin **code** under the watched dirs (`PYTEST_FAST_WATCH_DIRS`) so editing it respawns too.
 
 ### Client seam — wrapper clients with full data access
 

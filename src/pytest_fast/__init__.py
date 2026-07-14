@@ -101,6 +101,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Daemon",
     "RunResult",
+    "SummaryBlock",  # named piece of the summary box (the daemon-plugin render contract)
     "WorkerStats",
     "categorize",
     "default_workers",  # public worker-count API (auto-detect, ignores overrides)
@@ -2129,6 +2130,51 @@ class Daemon:
         full_report: bool = False,
         detailed: bool = False,
     ) -> str:
+        """Render the summary box: build the default named blocks, run them through the
+        daemon-plugin pipeline (which may append blocks or rewrite the whole layout — see
+        `_apply_daemon_plugins`), then flatten to text."""
+        blocks = self._report_blocks(
+            results,
+            worker_stats,
+            bus,
+            total,
+            warmup=warmup,
+            run=run,
+            label=label,
+            full_report=full_report,
+            detailed=detailed,
+        )
+        run_info: dict[str, object] = {
+            "results": results,
+            "worker_stats": worker_stats,
+            "bus": bus,
+            "total": total,
+            "warmup": warmup,
+            "run_wall": run,
+            "num_workers": self.num_workers,
+            "start_method": self.start_method,
+            "label": label,
+        }
+        blocks = _apply_daemon_plugins(run_info, blocks)
+        return "\n".join(ln for block in blocks for ln in block["lines"])
+
+    def _report_blocks(
+        self,
+        results: list[RunResult],
+        worker_stats: list[WorkerStats],
+        bus: dict[str, float],
+        total: int,
+        *,
+        warmup: float,
+        run: float,
+        label: str,
+        full_report: bool,
+        detailed: bool,
+    ) -> list[SummaryBlock]:
+        """The DEFAULT summary as named blocks (stable names — the plugin-facing contract):
+        `top`, `results`, `warmup`, `run`, `par`, [`detailed`], `bus`, [`failures`], [`xpass`],
+        [`durations` (full-report) | `slowest` (lean)], `bottom`. Conditional blocks are simply
+        absent when empty. Flattened output is byte-identical to the pre-block renderer."""
         from collections import Counter
 
         counts = Counter(r["outcome"] for r in results)
@@ -2137,15 +2183,26 @@ class Daemon:
         run_walls = [s["run_wall"] for s in worker_stats]
         breakdown = ", ".join(f"{n} {cat}" for cat, n in sorted(counts.items()))
         line = "═" * 66
-        out = [
-            f"\n{line}",
-            f"  {self.start_method.upper()} DAEMON  —  {self.num_workers}w  —  {label}",
-            line,
-            f"  results : {breakdown}  (n={len(results)}/{total})",
-            f"  warmup  : {warmup:6.2f}s   (fork+spawn; ~0 for resident rerun)",
-            f"  RUN     : {run:6.2f}s   ← wall",
-            f"  par.    : {(sum_busy / run if run else 0):.2f}x of {self.num_workers}"
-            f"   (run-wall max={max(run_walls) if run_walls else 0:.2f} min={min(run_walls) if run_walls else 0:.2f})",
+        blocks: list[SummaryBlock] = [
+            {
+                "name": "top",
+                "lines": [
+                    f"\n{line}",
+                    f"  {self.start_method.upper()} DAEMON  —  {self.num_workers}w  —  {label}",
+                    line,
+                ],
+            },
+            {"name": "results", "lines": [f"  results : {breakdown}  (n={len(results)}/{total})"]},
+            {"name": "warmup", "lines": [f"  warmup  : {warmup:6.2f}s   (fork+spawn; ~0 for resident rerun)"]},
+            {"name": "run", "lines": [f"  RUN     : {run:6.2f}s   ← wall"]},
+            {
+                "name": "par",
+                "lines": [
+                    f"  par.    : {(sum_busy / run if run else 0):.2f}x of {self.num_workers}"
+                    f"   (run-wall max={max(run_walls) if run_walls else 0:.2f}"
+                    f" min={min(run_walls) if run_walls else 0:.2f})"
+                ],
+            },
         ]
         if detailed:
             metrics = _parallelism_metrics(worker_stats, run, self.num_workers, results)
@@ -2153,51 +2210,48 @@ class Daemon:
             # logical = the hard cap for any worker-count suggestion.
             cores = _default_workers()
             logical = os.cpu_count() or cores
-            out.extend(_detailed_par_lines(metrics, run, self.num_workers, cores, logical))
-        out.append(f"  bus     : {int(bus['req_count'])} round-trips, {bus['rx'] / 1024:.0f}KB rx")
-        # Daemon-plugin summary sections (`PYTEST_FAST_DAEMON_PLUGINS`) — spliced INSIDE the box,
-        # right after the stats block (before FAILURES/SLOWEST): plugin verdicts are summary-grade
-        # signal, detail dumps stay below. See the plugin block near `_load_daemon_plugins`.
-        out.extend(
-            _daemon_plugin_summary_lines(
-                {
-                    "results": results,
-                    "worker_stats": worker_stats,
-                    "bus": bus,
-                    "total": total,
-                    "warmup": warmup,
-                    "run_wall": run,
-                    "num_workers": self.num_workers,
-                    "start_method": self.start_method,
-                    "label": label,
-                }
+            blocks.append(
+                {"name": "detailed", "lines": _detailed_par_lines(metrics, run, self.num_workers, cores, logical)}
             )
+        blocks.append(
+            {"name": "bus", "lines": [f"  bus     : {int(bus['req_count'])} round-trips, {bus['rx'] / 1024:.0f}KB rx"]}
         )
         if failed:
-            out.append(f"  FAILURES ({failed}):")
+            failure_lines = [f"  FAILURES ({failed}):"]
             for r in results:
                 if r["outcome"] not in {"failed", "error"}:
                     continue
-                out.append(f"    ✗ {r['nodeid']}")
+                failure_lines.append(f"    ✗ {r['nodeid']}")
                 longrepr = r.get("longrepr")
                 if isinstance(longrepr, str) and longrepr.strip():
-                    out.extend(f"      {ln}" for ln in longrepr.splitlines())
+                    failure_lines.extend(f"      {ln}" for ln in longrepr.splitlines())
+            blocks.append({"name": "failures", "lines": failure_lines})
         xpassed = [r for r in results if r["outcome"] == "xpassed"]
         if xpassed:
-            out.append(f"  XPASS ({len(xpassed)}) — stale xfail entries (now pass, drop them):")
-            out.extend(f"    ? {r['nodeid']}" for r in xpassed)
+            blocks.append(
+                {
+                    "name": "xpass",
+                    "lines": [f"  XPASS ({len(xpassed)}) — stale xfail entries (now pass, drop them):"]
+                    + [f"    ? {r['nodeid']}" for r in xpassed],
+                }
+            )
         if full_report:
             # Full-report mode: a real per-phase --durations table (from serialized reports).
-            out.extend(_durations_lines(results))
+            blocks.append({"name": "durations", "lines": _durations_lines(results)})
         else:
             # Lean mode: only whole-test durations are known — show the ≥1s offenders.
             slow = sorted(results, key=lambda r: r["duration"], reverse=True)
             slow = [r for r in slow if r["duration"] >= 1.0][:10]
             if slow:
-                out.append(f"  SLOWEST (≥1s, top {len(slow)}):")
-                out.extend(f"    {r['duration']:7.2f}s  {r['nodeid']}" for r in slow)
-        out.append(line)
-        return "\n".join(out)
+                blocks.append(
+                    {
+                        "name": "slowest",
+                        "lines": [f"  SLOWEST (≥1s, top {len(slow)}):"]
+                        + [f"    {r['duration']:7.2f}s  {r['nodeid']}" for r in slow],
+                    }
+                )
+        blocks.append({"name": "bottom", "lines": [line]})
+        return blocks
 
 
 def _lean_results(results: list[RunResult]) -> list[RunResult]:
@@ -2321,22 +2375,39 @@ def _watch_files() -> list[str]:
 # duration/cpu/extra, worker stats, wall/warmup) but — by architecture — NO pytest
 # session (collection lives in the forkserver preload). So daemon-side extensions are
 # plain importable modules, not pytest plugins: `PYTEST_FAST_DAEMON_PLUGINS=pkg.mod`
-# (comma/colon-separated import paths) names modules exposing
+# (comma/colon-separated import paths) names modules exposing either or both of:
 #
 #     def pytest_fast_run_completed(run_info: dict) -> Iterable[str] | None: ...
+#         # additive: the returned lines become a `plugin:<mod>` block placed right
+#         # after the `bus` stats block.
 #
-# fired after every non-bench run with run_info keys: `results` (list[RunResult]),
+#     def pytest_fast_render_summary(run_info: dict, blocks: list[SummaryBlock]) -> list[SummaryBlock] | None: ...
+#         # FULL control of the summary: receives every named block of the default
+#         # render (`top`/`results`/`warmup`/`run`/`par`/[`detailed`]/`bus`/
+#         # [`failures`]/[`xpass`]/[`durations`|`slowest`]/`bottom` + earlier
+#         # `plugin:*` blocks) and returns the new layout — reorder, drop, rewrite,
+#         # inject. Returning None keeps the (possibly mutated in place) list.
+#
+# Both fire after every non-bench run; run_info keys: `results` (list[RunResult]),
 # `worker_stats` (list[WorkerStats]), `bus`, `total`, `warmup`, `run_wall`,
-# `num_workers`, `start_method`, `label`. Returned lines are spliced into the summary
-# box right before the closing rule — that's how a timing gate, a flakiness tracker or
-# any custom reporter "edits" the pretty output without touching pytest-fast.
+# `num_workers`, `start_method`, `label`. Plugins run in env-list order, each
+# `render_summary` seeing the previous one's output (a pipeline).
 #
-# Failure policy: an import error / missing symbol / raising plugin degrades to a ⚠
-# line INSIDE the summary (never a crashed daemon, never a failed run). Silent
-# degradation is deliberately avoided — a gate that quietly stopped running would read
-# as "all clear". The env var is part of `_FINGERPRINT_KEYS`, so editing the plugin
-# LIST respawns the warm daemon; editing plugin CODE respawns it only if the module
-# lives under the watched dirs (`PYTEST_FAST_WATCH_DIRS`) — put it there.
+# Failure policy: an import error / missing hooks / raising plugin / malformed
+# render return degrades to a ⚠ line INSIDE the summary (never a crashed daemon,
+# never a failed run, never a silently-skipped gate). The env var is part of
+# `_FINGERPRINT_KEYS`, so editing the plugin LIST respawns the warm daemon; editing
+# plugin CODE respawns it only if the module lives under the watched dirs
+# (`PYTEST_FAST_WATCH_DIRS`) — put it there.
+
+
+class SummaryBlock(TypedDict):
+    """One named piece of the summary box. `name` is the stable id plugins address
+    blocks by; `lines` are printed verbatim (joined with newlines, no wrapping)."""
+
+    name: str
+    lines: list[str]
+
 
 _daemon_plugins_cache: list[tuple[str, ModuleType | None, str | None]] | None = None
 
@@ -2358,26 +2429,97 @@ def _load_daemon_plugins() -> list[tuple[str, ModuleType | None, str | None]]:
     return _daemon_plugins_cache
 
 
-def _daemon_plugin_summary_lines(run_info: dict[str, object]) -> list[str]:
-    """Fire `pytest_fast_run_completed(run_info)` on each daemon plugin and collect the
-    contributed summary lines. Every failure mode yields a visible ⚠ line instead."""
-    lines: list[str] = []
+def _insert_plugin_block(blocks: list[SummaryBlock], block: SummaryBlock) -> None:
+    """Place an additive `plugin:*` block after `bus` (after any earlier plugin blocks,
+    preserving env-list order); if a render hook removed `bus`, fall back to before
+    `bottom`, else append."""
+    anchor = -1
+    for index, existing in enumerate(blocks):
+        if existing["name"] == "bus" or existing["name"].startswith("plugin:"):
+            anchor = index
+    if anchor >= 0:
+        blocks.insert(anchor + 1, block)
+        return
+    for index, existing in enumerate(blocks):
+        if existing["name"] == "bottom":
+            blocks.insert(index, block)
+            return
+    blocks.append(block)
+
+
+def _coerce_blocks(raw: object) -> list[SummaryBlock] | None:
+    """Validate/normalize a render hook's return value. None → malformed (caller keeps
+    the previous layout and reports); lines are str()-coerced, names must be strings."""
+    if not isinstance(raw, list):
+        return None
+    coerced: list[SummaryBlock] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return None
+        entry_dict = cast("dict[str, object]", entry)
+        name = entry_dict.get("name")
+        lines = entry_dict.get("lines")
+        if not isinstance(name, str) or not isinstance(lines, list):
+            return None
+        coerced.append({"name": name, "lines": [str(ln) for ln in cast("list[object]", lines)]})
+    return coerced
+
+
+def _apply_daemon_plugins(run_info: dict[str, object], blocks: list[SummaryBlock]) -> list[SummaryBlock]:
+    """The daemon-plugin pipeline over the summary blocks (see the module comment above).
+
+    Per plugin, in env-list order: `pytest_fast_run_completed` contributes an additive
+    `plugin:<mod>` block after `bus`; `pytest_fast_render_summary` then gets the whole
+    layout and may return a replacement. Every failure mode becomes a ⚠ line in a
+    `plugin-errors` block before `bottom` — visible, never fatal, never silent."""
+    errors: list[str] = []
     for name, module, import_error in _load_daemon_plugins():
         if import_error is not None:
-            lines.append(f"  ⚠ daemon plugin {name!r}: import failed: {import_error}")
+            errors.append(f"  ⚠ daemon plugin {name!r}: import failed: {import_error}")
             continue
-        hook = getattr(module, "pytest_fast_run_completed", None)
-        if not callable(hook):
-            lines.append(f"  ⚠ daemon plugin {name!r}: no pytest_fast_run_completed(run_info) callable")
+        completed_hook = getattr(module, "pytest_fast_run_completed", None)
+        render_hook = getattr(module, "pytest_fast_render_summary", None)
+        if not callable(completed_hook) and not callable(render_hook):
+            errors.append(
+                f"  ⚠ daemon plugin {name!r}: neither pytest_fast_run_completed nor pytest_fast_render_summary found"
+            )
             continue
-        try:
-            contributed = cast("Iterable[object] | None", hook(run_info))
-        except Exception as exc:  # isolation barrier: plugin bug → visible line, run unaffected
-            lines.append(f"  ⚠ daemon plugin {name!r}: pytest_fast_run_completed raised: {exc!r}")
-            continue
-        if contributed:
-            lines.extend(str(entry) for entry in contributed)
-    return lines
+        if callable(completed_hook):
+            try:
+                contributed = cast("Iterable[object] | None", completed_hook(run_info))
+            except Exception as exc:  # isolation barrier: plugin bug → visible line, run unaffected
+                errors.append(f"  ⚠ daemon plugin {name!r}: pytest_fast_run_completed raised: {exc!r}")
+                contributed = None
+            if contributed:
+                lines = [str(entry) for entry in contributed]
+                if lines:
+                    _insert_plugin_block(blocks, {"name": f"plugin:{name}", "lines": lines})
+        if callable(render_hook):
+            try:
+                replaced = render_hook(run_info, blocks)
+            except Exception as exc:  # isolation barrier: broken layout hook keeps the default render
+                errors.append(f"  ⚠ daemon plugin {name!r}: pytest_fast_render_summary raised: {exc!r}")
+                continue
+            if replaced is None:
+                continue  # None = keep (possibly mutated in place) layout
+            coerced = _coerce_blocks(replaced)
+            if coerced is None:
+                errors.append(
+                    f"  ⚠ daemon plugin {name!r}: pytest_fast_render_summary returned malformed blocks — ignored"
+                )
+                continue
+            blocks = coerced
+    if errors:
+        _insert_error_block(blocks, errors)
+    return blocks
+
+
+def _insert_error_block(blocks: list[SummaryBlock], errors: list[str]) -> None:
+    for index, existing in enumerate(blocks):
+        if existing["name"] == "bottom":
+            blocks.insert(index, {"name": "plugin-errors", "lines": errors})
+            return
+    blocks.append({"name": "plugin-errors", "lines": errors})
 
 
 def _project_root() -> Path:
