@@ -132,7 +132,7 @@ def test_annotate_extra_reaches_daemon_plugin_and_summary(tmp_path: Path) -> Non
 
 
 def test_daemon_plugin_failures_degrade_to_visible_warnings(tmp_path: Path) -> None:
-    """Import error / missing symbol / raising impl → one ⚠ line each in the summary; the run
+    """Import error / missing hooks / raising impl → one ⚠ line each in the summary; the run
     itself stays green (rc 0) and healthy plugins in the same list still contribute."""
     project, out = tmp_path / "proj", tmp_path / "out"
     project.mkdir()
@@ -146,9 +146,60 @@ def test_daemon_plugin_failures_degrade_to_visible_warnings(tmp_path: Path) -> N
     proc = _run_local(project, {"PYTEST_FAST_DAEMON_PLUGINS": plugins})
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "⚠ daemon plugin 'definitely_missing_mod': import failed" in proc.stdout
-    assert "⚠ daemon plugin 'emptyplug': no pytest_fast_run_completed" in proc.stdout
+    assert "⚠ daemon plugin 'emptyplug': neither pytest_fast_run_completed nor pytest_fast_render_summary" in (
+        proc.stdout
+    )
     assert "⚠ daemon plugin 'badplug': pytest_fast_run_completed raised" in proc.stdout
     assert "⏱ gateplug: saw 2 results" in proc.stdout, "healthy plugin must still run after broken ones"
+
+
+def test_render_summary_hook_owns_the_whole_layout(tmp_path: Path) -> None:
+    """The full-control hook can retitle, reorder and drop blocks — the returned list IS the
+    summary. Here: custom header, `results` demoted below the plugin's own block, `bus`/`par`
+    dropped entirely."""
+    project, out = tmp_path / "proj", tmp_path / "out"
+    project.mkdir()
+    _make_seams_project(project, out)
+    (project / "layoutplug.py").write_text(
+        textwrap.dedent(
+            """
+            def pytest_fast_run_completed(run_info):
+                return ["  ⏱ layout: my own block"]
+
+            def pytest_fast_render_summary(run_info, blocks):
+                by_name = {b["name"]: b for b in blocks}
+                by_name["top"]["lines"][1] = "  ⚡ CUSTOM HEADER"
+                order = ["top", "run", "plugin:layoutplug", "results", "bottom"]
+                return [by_name[n] for n in order if n in by_name]
+            """
+        )
+    )
+
+    proc = _run_local(project, {"PYTEST_FAST_DAEMON_PLUGINS": "layoutplug"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = proc.stdout.splitlines()
+    assert any("⚡ CUSTOM HEADER" in ln for ln in lines), "top block must be rewritable"
+    assert not any(ln.startswith("  bus     :") for ln in lines), "dropped blocks must disappear"
+    assert not any(ln.startswith("  par.    :") for ln in lines), "dropped blocks must disappear"
+    run_at = next(i for i, ln in enumerate(lines) if ln.startswith("  RUN     :"))
+    plugin_at = next(i for i, ln in enumerate(lines) if "layout: my own block" in ln)
+    results_at = next(i for i, ln in enumerate(lines) if ln.startswith("  results :"))
+    assert run_at < plugin_at < results_at, "blocks must appear in the plugin-chosen order"
+
+
+def test_render_summary_malformed_return_keeps_default_layout(tmp_path: Path) -> None:
+    """A layout hook returning garbage degrades to a ⚠ line; the default render survives."""
+    project, out = tmp_path / "proj", tmp_path / "out"
+    project.mkdir()
+    _make_seams_project(project, out)
+    (project / "garbageplug.py").write_text(
+        "def pytest_fast_render_summary(run_info, blocks):\n    return 'not blocks at all'\n"
+    )
+
+    proc = _run_local(project, {"PYTEST_FAST_DAEMON_PLUGINS": "garbageplug"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "⚠ daemon plugin 'garbageplug': pytest_fast_render_summary returned malformed blocks" in proc.stdout
+    assert any(ln.startswith("  results :") for ln in proc.stdout.splitlines()), "default layout must survive"
 
 
 # ── resident daemon: the client seam (`want_results`) ────────────────────────
