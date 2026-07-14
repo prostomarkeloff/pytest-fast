@@ -122,11 +122,13 @@ def test_annotate_extra_reaches_daemon_plugin_and_summary(tmp_path: Path) -> Non
         "annotated:tests/test_s.py::test_b",
     ]
 
-    # Spliced INSIDE the box: the plugin line must sit above the closing rule.
+    # Spliced INSIDE the box, right after the stats block: bus line above, closing rule below —
+    # plugin verdicts are summary-grade signal, detail dumps (FAILURES/SLOWEST) stay lower.
     lines = proc.stdout.splitlines()
+    bus_at = next(i for i, ln in enumerate(lines) if ln.startswith("  bus     :"))
     gate_at = next(i for i, ln in enumerate(lines) if "gateplug: saw" in ln)
     closing_at = max(i for i, ln in enumerate(lines) if ln.startswith("═"))
-    assert gate_at < closing_at, "plugin section leaked outside the summary box"
+    assert bus_at < gate_at < closing_at, "plugin section must sit between the stats block and the closing rule"
 
 
 def test_daemon_plugin_failures_degrade_to_visible_warnings(tmp_path: Path) -> None:

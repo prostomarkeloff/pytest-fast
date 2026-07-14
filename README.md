@@ -431,7 +431,7 @@ lives in the forkserver preload. So daemon-side extensions are **plain modules**
 # myproj/timing_gate.py
 def pytest_fast_run_completed(run_info):
     slow = [r for r in run_info["results"] if r["duration"] > 5.0]
-    return [f"  ⏱ my-gate: {len(slow)} slow tests"]  # spliced into the box before the closing rule
+    return [f"  ⏱ my-gate: {len(slow)} slow tests"]  # spliced into the box after the stats block
 ```
 
 `run_info` keys: `results` (list of `RunResult` — nodeid/outcome/duration/cpu/extra/…),
