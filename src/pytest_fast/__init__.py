@@ -2155,6 +2155,24 @@ class Daemon:
             logical = os.cpu_count() or cores
             out.extend(_detailed_par_lines(metrics, run, self.num_workers, cores, logical))
         out.append(f"  bus     : {int(bus['req_count'])} round-trips, {bus['rx'] / 1024:.0f}KB rx")
+        # Daemon-plugin summary sections (`PYTEST_FAST_DAEMON_PLUGINS`) — spliced INSIDE the box,
+        # right after the stats block (before FAILURES/SLOWEST): plugin verdicts are summary-grade
+        # signal, detail dumps stay below. See the plugin block near `_load_daemon_plugins`.
+        out.extend(
+            _daemon_plugin_summary_lines(
+                {
+                    "results": results,
+                    "worker_stats": worker_stats,
+                    "bus": bus,
+                    "total": total,
+                    "warmup": warmup,
+                    "run_wall": run,
+                    "num_workers": self.num_workers,
+                    "start_method": self.start_method,
+                    "label": label,
+                }
+            )
+        )
         if failed:
             out.append(f"  FAILURES ({failed}):")
             for r in results:
@@ -2178,23 +2196,6 @@ class Daemon:
             if slow:
                 out.append(f"  SLOWEST (≥1s, top {len(slow)}):")
                 out.extend(f"    {r['duration']:7.2f}s  {r['nodeid']}" for r in slow)
-        # Daemon-plugin summary sections (`PYTEST_FAST_DAEMON_PLUGINS`) — spliced INSIDE the box,
-        # right before the closing rule. See the plugin block near `_load_daemon_plugins`.
-        out.extend(
-            _daemon_plugin_summary_lines(
-                {
-                    "results": results,
-                    "worker_stats": worker_stats,
-                    "bus": bus,
-                    "total": total,
-                    "warmup": warmup,
-                    "run_wall": run,
-                    "num_workers": self.num_workers,
-                    "start_method": self.start_method,
-                    "label": label,
-                }
-            )
-        )
         out.append(line)
         return "\n".join(out)
 
