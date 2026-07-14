@@ -397,6 +397,76 @@ small runs against a heavyweight session fixture (a DB engine + schema seed, an 
 
 ---
 
+## Extending pytest-fast (0.12+): wrappers & plugins
+
+Three extension seams, one per process role. Each uses the mechanism native to where it runs: pytest's
+own hook system where a pytest session exists (workers), plain importable modules where it doesn't
+(the daemon), and the wire protocol for clients.
+
+### Worker seam — custom per-test measurements on the bus
+
+Workers run the **full pytest protocol**, so ordinary pytest hooks, hookwrappers and fixtures already
+execute inside them — measure whatever you want the usual way. The missing piece was the channel to
+ship a measurement back: implement pytest-fast's own hook (in `conftest.py` or any pytest plugin) and
+write into `extra` — it rides the worker→master bus next to `duration`/`cpu` as `result["extra"]`:
+
+```python
+# conftest.py
+def pytest_fast_annotate_result(item, result, extra):
+    # result is read-only context: {"nodeid", "outcome", "duration", ...}
+    extra["sql_queries"] = getattr(item, "_my_query_counter", 0)
+```
+
+Fired once per test in the worker (hot path — keep it cheap). Exceptions degrade to a stderr note in
+the daemon log, never a failed test. Per-test **CPU time is already built in**: every lean run ships
+`result["cpu"]` (`duration − cpu ≈ I/O wait`) — no plugin needed.
+
+### Daemon seam — sections inside the summary box
+
+The daemon holds every run's aggregated data but (by architecture) no pytest session — collection
+lives in the forkserver preload. So daemon-side extensions are **plain modules**, named in
+`PYTEST_FAST_DAEMON_PLUGINS` (comma-separated import paths):
+
+```python
+# myproj/timing_gate.py
+def pytest_fast_run_completed(run_info):
+    slow = [r for r in run_info["results"] if r["duration"] > 5.0]
+    return [f"  ⏱ my-gate: {len(slow)} slow tests"]  # spliced into the box before the closing rule
+```
+
+`run_info` keys: `results` (list of `RunResult` — nodeid/outcome/duration/cpu/extra/…),
+`worker_stats`, `bus`, `total`, `warmup`, `run_wall`, `num_workers`, `start_method`, `label`.
+Failure policy: import errors / missing symbol / raising plugins become a visible `⚠` line in the
+summary — never a crashed daemon, never a silently-missing gate. The env var participates in the
+staleness fingerprint (changing the list respawns the warm daemon); keep plugin **code** under the
+watched dirs (`PYTEST_FAST_WATCH_DIRS`) so editing it respawns too.
+
+### Client seam — wrapper clients with full data access
+
+Build your own front-end on two public calls: `run_via_daemon` (the ensure/stale-respawn
+orchestration the CLI and the `--fast` plugin themselves use) and `request_run(want_results=True)`
+(the final frame then carries `results`, `worker_stats`, `run_meta` — ~100 bytes/test, no full-report
+bus cost):
+
+```python
+from pytest_fast import request_run, resolve_workers, run_via_daemon
+
+frame = run_via_daemon(
+    resolve_workers(None), "forkserver", "/tmp/my.sock", ttl=600, with_watcher=False,
+    run=lambda addr: request_run(addr, want_results=True),
+)
+for r in frame.get("results", []):   # keys are optional on daemons predating 0.12
+    ...                              # r["nodeid"], r["duration"], r["cpu"], r.get("extra")
+print(frame["summary"])              # the pretty box — post-process/splice as you like
+raise SystemExit(int(frame.get("rc", 1)))
+```
+
+Protocol compatibility contract: run-request tuples grow positionally (older daemons ignore trailing
+elements), reply frames are dicts (treat unknown keys as optional). A streaming variant with the same
+orchestration: `request_run_streamed(addr, on_report=...)` — every per-phase report as it happens.
+
+---
+
 ## Limitations
 
 - **POSIX only.** `fcntl`, `AF_UNIX`, `multiprocessing.forkserver` are required; the package imports `fcntl` at the top, so Windows fails on import. Use xdist on Windows.

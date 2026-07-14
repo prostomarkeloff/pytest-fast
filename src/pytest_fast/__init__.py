@@ -76,8 +76,9 @@ import pluggy
 
 if TYPE_CHECKING:
     import cProfile
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from multiprocessing.context import DefaultContext
+    from types import ModuleType
 
     from _pytest.config import Config
     from _pytest.config.argparsing import Parser
@@ -108,6 +109,7 @@ __all__ = [
     "request_run",  # client-side, module-level
     "request_run_streamed",  # client-side streaming (used by the --fast plugin controller)
     "resolve_workers",  # public worker-count API (full precedence; stable for external tooling)
+    "run_via_daemon",  # client-side ensure/stale-respawn orchestration (stable for external tooling)
 ]
 
 
@@ -117,7 +119,10 @@ class RunResult(TypedDict):
     nodeid: str
     outcome: str
     duration: float
-    cpu: NotRequired[float]  # per-test process CPU time (duration − cpu ≈ I/O wait); for `bench`
+    # Per-test process CPU time (duration − cpu ≈ I/O wait). Stamped by the standard worker loop
+    # on EVERY run (lean included) — consumers (`bench` I/O-vs-CPU, timing gates via
+    # `want_results`) may rely on it there; absent in `--persist-workers` mode.
+    cpu: NotRequired[float]
     # cProfile rows (qualname, ncalls, tottime, cumtime) for the test, top-by-cumtime — only on the
     # targeted profiling pass `bench` runs over its top bottleneck tests. Deterministic call counts.
     profile: NotRequired[list[tuple[str, int, float, float]]]
@@ -126,6 +131,11 @@ class RunResult(TypedDict):
     # present only in full-report mode — lets the master/controller replay them through a real
     # terminalreporter (--durations, junit, -v/-s, plugins). See `_run_one_item(full_report=...)`.
     reports: NotRequired[list[dict[str, object]]]
+    # Plugin-attached per-test payload — the write channel of the `pytest_fast_annotate_result`
+    # worker hook (see `_PytestFastHookSpecs`). Custom measurements ride the existing bus next to
+    # duration/cpu and surface to daemon plugins (`PYTEST_FAST_DAEMON_PLUGINS`) and to clients
+    # that requested `want_results`. Absent when no plugin wrote anything.
+    extra: NotRequired[dict[str, object]]
 
 
 class WorkerStats(TypedDict):
@@ -1002,6 +1012,16 @@ def _run_one_item(
             cast("dict[str, object]", config.hook.pytest_report_to_serializable(config=config, report=rep))
             for rep in collector.reports
         ]
+    # Plugin measurement channel (see `pytest_fast_annotate_result` hookspec). Guarded: a broken
+    # measurement plugin must degrade to a missing annotation + a stderr note (→ daemon log), never
+    # to a failed test or a crashed worker (which would flag the whole run untrusted).
+    extra: dict[str, object] = {}
+    try:
+        item.ihook.pytest_fast_annotate_result(item=item, result=result, extra=extra)
+    except Exception as exc:  # isolation barrier around third-party hookimpls
+        print(f"[pytest-fast] pytest_fast_annotate_result failed on {item.nodeid!r}: {exc!r}", file=sys.stderr)
+    if extra:
+        result["extra"] = extra
     return result
 
 
@@ -1356,6 +1376,10 @@ class Daemon:
         if start_method == "forkserver":
             self.ctx.set_forkserver_preload(["pytest_fast"])
         self._run_counter = 0
+        # Raw outcome of the most recent run request — the `want_results` data source (see the
+        # serve loop). Reset before each request; left None by modes that don't produce a single
+        # canonical outcome (bench).
+        self._last_outcome: _RunOutcome | None = None
         # The `_PYTEST_FAST_COLLECT` flag is NOT set here on purpose — it's a global
         # side effect that would leak into env even if the object is built but not used.
         # We set it immediately before the first `Process.start()` (see `_arm_collect_flag`),
@@ -1556,6 +1580,7 @@ class Daemon:
     ) -> tuple[int, str]:
         """Serve a single `run` request against the warm pool, render its summary (workers stay warm)."""
         o = self._dispatch_persist(pool, selection=selection, progress_conn=progress_conn, report_conn=report_conn)
+        self._last_outcome = o
         summary = self._report(
             o.results,
             o.worker_stats,
@@ -1703,10 +1728,12 @@ class Daemon:
                         _log("daemon", f"{reason} — exiting stale")
                         _try_send(conn, {"stale": True})  # best-effort; exit stale regardless
                         return 0  # finally releases the socket → client spawns a fresh daemon
-                    # Optional args: ('run', fp, full_report[, stream[, nodeids]]). Old clients send
-                    # only fp → lean. `stream` (the plugin controller) asks the daemon to stream the
-                    # serialized per-phase reports back; `nodeids` (the controller's collected set)
-                    # restricts the run to that selection.
+                    # Optional args: ('run', fp, full_report[, stream[, nodeids[, detailed[, bench
+                    # [, want_results]]]]]). Old clients send a shorter tuple → positional defaults;
+                    # newer clients' extra elements are simply not read by an older daemon (both
+                    # directions stay compatible). `stream` (the plugin controller) asks the daemon to
+                    # stream the serialized per-phase reports back; `nodeids` (the controller's
+                    # collected set) restricts the run to that selection.
                     full_report = bool(fp_args[1]) if len(fp_args) > 1 else False
                     stream = len(fp_args) > 2 and bool(fp_args[2])
                     selection = (
@@ -1718,6 +1745,10 @@ class Daemon:
                     # irrelevant in stream mode (the plugin controller renders natively).
                     detailed = len(fp_args) > 4 and bool(fp_args[4])
                     bench = int(fp_args[5]) if len(fp_args) > 5 and isinstance(fp_args[5], int) else 0
+                    # `want_results` (wrapper clients): also ship the run's lean per-test results +
+                    # worker stats + run meta in the final frame. See `request_run(want_results=...)`.
+                    want_results = len(fp_args) > 6 and bool(fp_args[6])
+                    self._last_outcome = None  # a mode that doesn't produce one must not ship a stale one
                     if self.persist_workers and bench == 0:
                         # Warm pool: fork once (lazily), reuse across requests → session fixtures set up
                         # once. Always capture nodeids so any request's selection resolves to indices.
@@ -1752,8 +1783,20 @@ class Daemon:
                         # client's terminal — so we stream progress over this same socket
                         # (otherwise the client sits silent the whole run and looks frozen).
                         rc, summary = self._run_once(progress_conn=conn, full_report=full_report, detailed=detailed)
+                    final_frame: dict[str, object] = {"rc": rc, "summary": summary}
+                    if want_results and self._last_outcome is not None:
+                        o = self._last_outcome
+                        final_frame["results"] = _lean_results(o.results)
+                        final_frame["worker_stats"] = o.worker_stats
+                        final_frame["run_meta"] = {
+                            "total": o.total,
+                            "warmup": o.warmup,
+                            "run_wall": o.run_wall,
+                            "num_workers": self.num_workers,
+                            "start_method": self.start_method,
+                        }
                     try:
-                        _send(conn, {"rc": rc, "summary": summary})
+                        _send(conn, final_frame)
                     except OSError:
                         # client gone (Ctrl-C) before the final frame — the run is already done,
                         # the daemon does NOT crash (used to crash on BrokenPipe here), stays warm
@@ -1864,6 +1907,7 @@ class Daemon:
         detailed: bool = False,
     ) -> tuple[int, str]:
         o = self._execute_run(progress_conn, full_report=full_report, report_conn=report_conn, selection=selection)
+        self._last_outcome = o
         label = "BOOT (collect once)" if o.idx == 0 else f"run #{o.idx} (warm)"
         summary = self._report(
             o.results,
@@ -2134,15 +2178,44 @@ class Daemon:
             if slow:
                 out.append(f"  SLOWEST (≥1s, top {len(slow)}):")
                 out.extend(f"    {r['duration']:7.2f}s  {r['nodeid']}" for r in slow)
+        # Daemon-plugin summary sections (`PYTEST_FAST_DAEMON_PLUGINS`) — spliced INSIDE the box,
+        # right before the closing rule. See the plugin block near `_load_daemon_plugins`.
+        out.extend(
+            _daemon_plugin_summary_lines(
+                {
+                    "results": results,
+                    "worker_stats": worker_stats,
+                    "bus": bus,
+                    "total": total,
+                    "warmup": warmup,
+                    "run_wall": run,
+                    "num_workers": self.num_workers,
+                    "start_method": self.start_method,
+                    "label": label,
+                }
+            )
+        )
         out.append(line)
         return "\n".join(out)
+
+
+def _lean_results(results: list[RunResult]) -> list[RunResult]:
+    """Project results to their lean shape for the `want_results` final frame: drop the heavy
+    per-phase `reports` (full-report runs) — wrapper clients want nodeid/outcome/duration/cpu/
+    extra/longrepr, not a re-ship of the whole wire-form report stream."""
+    return [cast("RunResult", {k: v for k, v in r.items() if k != "reports"}) for r in results]
 
 
 # ── client-side: request a run from the resident daemon ──────────────────────
 
 
 def request_run(
-    address: str, *, full_report: bool = False, detailed: bool = False, bench: int = 0
+    address: str,
+    *,
+    full_report: bool = False,
+    detailed: bool = False,
+    bench: int = 0,
+    want_results: bool = False,
 ) -> dict[str, object]:
     """Trigger a run on the daemon; stream progress to stdout, return the final frame
     (`{rc, summary}` or `{stale: True}`). The daemon sends N `{'progress': (done,total)}`
@@ -2152,17 +2225,23 @@ def request_run(
     a real --durations table in the summary). The flag rides as the 2nd tuple element, so
     a daemon that predates it simply ignores it and runs lean.
 
+    `want_results` (wrapper clients) asks the daemon to also put the run's per-test data into
+    the final frame: `results` (lean `RunResult`s — nodeid/outcome/duration/cpu/extra/longrepr,
+    never the heavy per-phase `reports`), `worker_stats` (list[WorkerStats]) and `run_meta`
+    ({total, warmup, run_wall, num_workers, start_method}). ~100 bytes/test on the wire. A daemon
+    predating the flag returns the plain `{rc, summary}` frame — treat the keys as optional.
+
     Module-level (not a method of `Daemon`) — this is the **client**, not a server
     method; keeping it on `Daemon` would mix both protocol sides into one class."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     with _short_unix_path(address) as connect_path:
         sock.connect(connect_path)
     with sock:
-        # ('run', fp, full_report, stream, nodeids, detailed, bench) — non-streamed CLI run, so
-        # stream=False / nodeids=None; `bench` (an int run-count, 0=off) makes the daemon render the
-        # bottleneck report (it forces full reports itself). Trailing elements are ignored by a
-        # daemon predating them (back-compatible).
-        _send(sock, ("run", _env_fingerprint(), full_report, False, None, detailed, bench))
+        # ('run', fp, full_report, stream, nodeids, detailed, bench, want_results) — non-streamed
+        # CLI run, so stream=False / nodeids=None; `bench` (an int run-count, 0=off) makes the daemon
+        # render the bottleneck report (it forces full reports itself). Trailing elements are ignored
+        # by a daemon predating them (back-compatible).
+        _send(sock, ("run", _env_fingerprint(), full_report, False, None, detailed, bench, want_results))
         while True:
             raw, _ = _recv(sock)
             if not isinstance(raw, dict):
@@ -2235,6 +2314,71 @@ def _watch_files() -> list[str]:
     return _split_env_list("PYTEST_FAST_WATCH_FILES", ["pyproject.toml", "pytest.ini"])
 
 
+# ── daemon-side plugins (`PYTEST_FAST_DAEMON_PLUGINS`) ───────────────────────
+#
+# The daemon process holds every run's aggregated data (results incl. per-test
+# duration/cpu/extra, worker stats, wall/warmup) but — by architecture — NO pytest
+# session (collection lives in the forkserver preload). So daemon-side extensions are
+# plain importable modules, not pytest plugins: `PYTEST_FAST_DAEMON_PLUGINS=pkg.mod`
+# (comma/colon-separated import paths) names modules exposing
+#
+#     def pytest_fast_run_completed(run_info: dict) -> Iterable[str] | None: ...
+#
+# fired after every non-bench run with run_info keys: `results` (list[RunResult]),
+# `worker_stats` (list[WorkerStats]), `bus`, `total`, `warmup`, `run_wall`,
+# `num_workers`, `start_method`, `label`. Returned lines are spliced into the summary
+# box right before the closing rule — that's how a timing gate, a flakiness tracker or
+# any custom reporter "edits" the pretty output without touching pytest-fast.
+#
+# Failure policy: an import error / missing symbol / raising plugin degrades to a ⚠
+# line INSIDE the summary (never a crashed daemon, never a failed run). Silent
+# degradation is deliberately avoided — a gate that quietly stopped running would read
+# as "all clear". The env var is part of `_FINGERPRINT_KEYS`, so editing the plugin
+# LIST respawns the warm daemon; editing plugin CODE respawns it only if the module
+# lives under the watched dirs (`PYTEST_FAST_WATCH_DIRS`) — put it there.
+
+_daemon_plugins_cache: list[tuple[str, ModuleType | None, str | None]] | None = None
+
+
+def _load_daemon_plugins() -> list[tuple[str, ModuleType | None, str | None]]:
+    """Import the `PYTEST_FAST_DAEMON_PLUGINS` modules once per process.
+    Entries: (name, module | None, import_error | None)."""
+    global _daemon_plugins_cache
+    if _daemon_plugins_cache is None:
+        import importlib
+
+        loaded: list[tuple[str, ModuleType | None, str | None]] = []
+        for name in _split_env_list("PYTEST_FAST_DAEMON_PLUGINS", []):
+            try:
+                loaded.append((name, importlib.import_module(name), None))
+            except Exception as exc:  # isolation barrier: a typo'd plugin must not kill the daemon
+                loaded.append((name, None, repr(exc)))
+        _daemon_plugins_cache = loaded
+    return _daemon_plugins_cache
+
+
+def _daemon_plugin_summary_lines(run_info: dict[str, object]) -> list[str]:
+    """Fire `pytest_fast_run_completed(run_info)` on each daemon plugin and collect the
+    contributed summary lines. Every failure mode yields a visible ⚠ line instead."""
+    lines: list[str] = []
+    for name, module, import_error in _load_daemon_plugins():
+        if import_error is not None:
+            lines.append(f"  ⚠ daemon plugin {name!r}: import failed: {import_error}")
+            continue
+        hook = getattr(module, "pytest_fast_run_completed", None)
+        if not callable(hook):
+            lines.append(f"  ⚠ daemon plugin {name!r}: no pytest_fast_run_completed(run_info) callable")
+            continue
+        try:
+            contributed = cast("Iterable[object] | None", hook(run_info))
+        except Exception as exc:  # isolation barrier: plugin bug → visible line, run unaffected
+            lines.append(f"  ⚠ daemon plugin {name!r}: pytest_fast_run_completed raised: {exc!r}")
+            continue
+        if contributed:
+            lines.extend(str(entry) for entry in contributed)
+    return lines
+
+
 def _project_root() -> Path:
     """Project root for the `*.py` mtime scan. Default — `os.getcwd()` at call time
     (where `pytest-fast` was launched from). Override — `PYTEST_FAST_ROOT` (absolute
@@ -2300,6 +2444,7 @@ _FINGERPRINT_KEYS = (
     "PYTEST_FAST_ROOT",
     "PYTEST_FAST_ENV_PREFIXES",  # change in the prefix list itself must respawn too
     "PYTEST_FAST_WORKER_IDENTITY",  # opt-in per-worker xdist identity changes worker setup → respawn
+    "PYTEST_FAST_DAEMON_PLUGINS",  # daemon-side plugin list is baked at first use → respawn on change
 )
 
 
@@ -2600,7 +2745,7 @@ def _coordinated_spawn(workers: int, start_method: str, address: str, ttl: float
         _spawn_daemon(workers, start_method, address, ttl)
 
 
-def _run_via_daemon(
+def run_via_daemon(
     workers: int,
     start_method: str,
     address: str,
@@ -2612,8 +2757,11 @@ def _run_via_daemon(
     """Ensure a resident daemon at `address`, then execute `run(address)` against it —
     spawning the daemon if absent and respawning it on a `{stale}` reply, bounded by the
     boot deadline. Returns the final frame from `run` (`{rc, summary}`), or `{rc: 1}` if the
-    daemon never came up / kept reporting stale. Shared by the CLI client (`_ensure_and_run`)
-    and the `--fast` plugin controller (`pytest_runtestloop`).
+    daemon never came up / kept reporting stale. Shared by the CLI client (`_ensure_and_run`),
+    the `--fast` plugin controller (`pytest_runtestloop`) — and PUBLIC (stable for external
+    tooling): a wrapper client composes it with `request_run(..., want_results=True)` /
+    `request_run_streamed(...)` as the `run` callable and gets the full ensure/stale/respawn
+    orchestration for free.
 
     Stale is detected by the daemon BEFORE it runs anything (it replies `{stale}` and exits),
     so a streaming `run` that gets respawned never double-emits reports."""
@@ -2660,7 +2808,7 @@ def _ensure_and_run(
     bench: int = 0,
 ) -> int:
     """CLI client (front A): connect to the daemon → run → print the daemon-rendered summary."""
-    reply = _run_via_daemon(
+    reply = run_via_daemon(
         workers,
         start_method,
         address,
@@ -2810,6 +2958,20 @@ class _PytestFastHookSpecs:
         carries the populated ``config.workerinput``; ``workerid`` / ``workercount`` mirror
         ``PYTEST_XDIST_WORKER`` / ``PYTEST_XDIST_WORKER_COUNT``."""
 
+    @_pytest_fast_hookspec
+    def pytest_fast_annotate_result(self, item: Item, result: RunResult, extra: dict[str, object]) -> None:
+        """Fired in the WORKER right after each test's runtest protocol completes — the bus channel
+        for custom per-test measurements. ``result`` is the read side (outcome/duration/longrepr,
+        already final); ``extra`` is the WRITE side: keys a hookimpl puts there ride the worker→master
+        bus as ``result["extra"]`` and surface to daemon plugins (``PYTEST_FAST_DAEMON_PLUGINS``) and
+        to clients that requested ``want_results``. Values must be pickle-able plain data.
+
+        The measuring itself belongs in ordinary pytest hooks/fixtures — they already run inside
+        pytest-fast workers (the full protocol is used); stash what you measured on the item (e.g.
+        ``item.stash``) and harvest it here. HOT PATH: fired once per test — keep impls cheap and
+        allocation-light. Exceptions are caught, reported to stderr (→ daemon log) and never fail
+        the test."""
+
 
 def pytest_addhooks(pluginmanager: pluggy.PluginManager) -> None:
     """Register pytest-fast's own hookspecs so plugins may implement ``pytest_fast_configure_worker``
@@ -2899,7 +3061,7 @@ def pytest_runtestloop(session: Session) -> bool | None:
 
     # Forward THIS session's collected nodeids → the daemon runs exactly that selection (so
     # -k/-m/explicit paths work; the full suite is just "all nodeids").
-    reply = _run_via_daemon(
+    reply = run_via_daemon(
         workers,
         "forkserver",
         address,
