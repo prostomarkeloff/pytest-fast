@@ -2453,7 +2453,7 @@ def _validate_fresh_workers_ack(frame: dict[str, object], *, requested: bool) ->
     if requested and frame.get("stale") is not True and frame.get("fresh_workers") is not True:
         return {
             "rc": 2,
-            "summary": "[pytest-fast] daemon does not support fresh_workers; restart it with pytest-fast >=0.15",
+            "summary": "[pytest-fast] daemon does not support fresh_workers; restart it with pytest-fast >=0.14",
         }
     return frame
 
