@@ -6,8 +6,10 @@ everything breaks. We test roundtrip, EOF-handling, and multi-message ordering."
 from __future__ import annotations
 
 import socket
+import threading
+from pathlib import Path
 
-from pytest_fast import _recv, _send
+from pytest_fast import _recv, _send, _short_unix_path, request_run, request_run_streamed
 
 
 def test_roundtrip_basic_types() -> None:
@@ -74,3 +76,88 @@ def test_messages_are_framed_independently() -> None:
     finally:
         a.close()
         b.close()
+
+
+def test_run_frame_keeps_execution_modes_as_trailing_fields() -> None:
+    """Execution-mode extensions remain safe for daemons that ignore unknown tuple tails."""
+    a, b = socket.socketpair()
+    frame = ("run", "fingerprint", True, True, ["tests/test_x.py::test_x"], False, 0, False, True, False)
+    try:
+        _send(a, frame)
+        received, _ = _recv(b)
+        assert received == frame
+        assert isinstance(received, tuple)
+        assert received[-2:] == (True, False)
+    finally:
+        a.close()
+        b.close()
+
+
+def _serve_legacy_run_frame(address: Path) -> threading.Thread:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    with _short_unix_path(str(address)) as bind_path:
+        listener.bind(bind_path)
+    listener.listen(1)
+
+    def serve() -> None:
+        with listener:
+            conn, _ = listener.accept()
+            with conn:
+                _recv(conn)
+                _send(conn, {"rc": 0, "summary": "legacy daemon ran the request"})
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    return thread
+
+
+def test_stop_on_failure_rejects_legacy_daemon_without_capability_ack(tmp_path: Path) -> None:
+    """A legacy daemon must not produce a trusted stop-first result."""
+    address = tmp_path / "legacy.sock"
+    thread = _serve_legacy_run_frame(address)
+    try:
+        reply = request_run(str(address), stop_on_failure=True)
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert reply.get("rc") == 2
+    assert "does not support stop_on_failure" in str(reply.get("summary"))
+
+
+def test_streamed_stop_on_failure_rejects_legacy_daemon_without_capability_ack(tmp_path: Path) -> None:
+    """The streamed client enforces the same stop-first capability contract."""
+    address = tmp_path / "legacy-stream.sock"
+    thread = _serve_legacy_run_frame(address)
+    try:
+        reply = request_run_streamed(str(address), lambda _report: None, stop_on_failure=True)
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert reply.get("rc") == 2
+    assert "does not support stop_on_failure" in str(reply.get("summary"))
+
+
+def test_fresh_workers_rejects_legacy_daemon_without_capability_ack(tmp_path: Path) -> None:
+    """A legacy daemon must not produce a trusted fresh-worker result."""
+    address = tmp_path / "legacy-fresh.sock"
+    thread = _serve_legacy_run_frame(address)
+    try:
+        reply = request_run(str(address), fresh_workers=True)
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert reply.get("rc") == 2
+    assert "does not support fresh_workers" in str(reply.get("summary"))
+
+
+def test_streamed_fresh_workers_rejects_legacy_daemon_without_capability_ack(tmp_path: Path) -> None:
+    """The streamed client enforces the same fresh-worker capability contract."""
+    address = tmp_path / "legacy-stream-fresh.sock"
+    thread = _serve_legacy_run_frame(address)
+    try:
+        reply = request_run_streamed(str(address), lambda _report: None, fresh_workers=True)
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert reply.get("rc") == 2
+    assert "does not support fresh_workers" in str(reply.get("summary"))
