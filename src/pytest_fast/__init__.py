@@ -166,7 +166,9 @@ class _RunOutcome(NamedTuple):
     bus: dict[str, float]
     warmup: float  # fork+spawn time (t_ready − t0)
     run_wall: float  # execution wall (t_done − t_ready)
-    total: int
+    total: int  # items actually dispatched in this run
+    planned_total: int  # selected items before an optional stop-first short-circuit
+    short_circuited: bool
     idx: int
     exitcodes: list[int | None]
 
@@ -1235,9 +1237,9 @@ def _worker_persist_main(
 ) -> None:
     """Persist-mode worker (opt-in `--persist-workers`, serve mode): forked ONCE, its pytest session
     spans MANY run requests. Between runs the session — and its session-scoped fixtures — stays alive:
-    at each run's end the last item tears down against a session-sharing ``anchor`` item (never
-    ``nextitem=None``), so pytest keeps session-scoped fixtures. Only at ``stop`` (daemon shutdown)
-    does the final item tear down with ``nextitem=None`` (full session teardown), then the worker exits.
+    at each run's end the last item tears down against a synthetic Item whose parent is the Session,
+    so pytest keeps only session-scoped fixtures. Only at ``stop`` (daemon shutdown) does setup-state
+    tear down with ``nextitem=None`` (full session teardown), then the worker exits.
 
     Per-run protocol over the pool socket: the master answers the worker's ``('req', result)`` with
     ``('idx', pick)`` to run the next item, ``('flush',)`` once the run's queue is drained, or
@@ -1245,7 +1247,18 @@ def _worker_persist_main(
     stays warm. The one-item lag (a result ships on the NEXT req) is preserved; ``flush`` runs the held
     last item against the anchor and ships its result before ``run_done``."""
     t_start = time.perf_counter()
+    from _pytest.nodes import Item as RuntimeItem
+
     import pytest_fast
+
+    class _SessionBoundaryItem(RuntimeItem):
+        """Real pytest Item used only as the fixture boundary between persistent requests."""
+
+        def runtest(self) -> None:
+            raise AssertionError("session boundary items are never executed")
+
+        def reportinfo(self) -> tuple[Path, int | None, str]:
+            return self.config.rootpath, None, self.name
 
     config = pytest_fast.collected_config
     assert config is not None, "forkserver/spawn must have collected tests before worker start"
@@ -1257,7 +1270,14 @@ def _worker_persist_main(
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(pool_sock_path)
-    anchor = items[0] if items else None  # any collected item shares session scope → keeps session fixtures alive
+    anchor = items[0] if items else None
+    # A genuine Item keeps third-party pytest_runtest_protocol hooks on their declared contract.
+    # Its direct Session parent makes the common setup-state prefix exactly the session scope.
+    session_boundary = (
+        _SessionBoundaryItem.from_parent(anchor.session, name="pytest-fast-session-boundary")
+        if anchor is not None
+        else None
+    )
     ready_nodeids = [it.nodeid for it in items] if send_nodeids else None
     _send(sock, ("ready", wid, len(items), collect_wall, ready_nodeids))
 
@@ -1267,6 +1287,7 @@ def _worker_persist_main(
         pending: RunResult | None = None
         ran = 0
         busy = 0.0
+        eager_run = False
         run_start = time.perf_counter()
         while True:  # one run
             _send(sock, ("req", wid, pending))
@@ -1281,14 +1302,14 @@ def _worker_persist_main(
             if tag == "flush":
                 if prev is not None:
                     t0 = time.perf_counter()
-                    # nextitem keeps the SESSION alive across runs, but MUST differ from prev — else pytest
-                    # keeps prev's function-scoped fixtures (nextitem still needs them) and the next re-run of
-                    # prev can't re-inject them (KeyError). anchor=items[0] normally; opposite end if prev IS it.
-                    nxt = anchor if anchor is not prev else next((it for it in reversed(items) if it is not prev), None)
-                    pending = _run_one_item(prev, nxt, collector, full_report=True)
+                    pending = _run_one_item(prev, session_boundary, collector, full_report=True)
                     busy += time.perf_counter() - t0
                     ran += 1
                     _send(sock, ("req", wid, pending))  # ship the run's last result
+                elif eager_run and session_boundary is not None:
+                    # A short-circuit may leave setup-state pointing at the undispatched lookahead
+                    # item used as pytest's nextitem. Retain only session-scoped fixtures across requests.
+                    session_boundary.session._setupstate.teardown_exact(session_boundary)
                 stats: WorkerStats = {
                     "wid": wid,
                     "ran": ran,
@@ -1301,6 +1322,24 @@ def _worker_persist_main(
                 break  # wait for the next run; session (and session fixtures) stays warm
             idx = reply[1]  # ('idx', pick)
             cur = items[idx] if isinstance(idx, int) and 0 <= idx < len(items) else None
+            eager = len(reply) > 2 and bool(reply[2])
+            if eager and cur is not None:
+                # Stop-first requests cannot use the normal one-item lag: by the time the master
+                # sees item N fail, item N+1 would already be held and `flush` would execute it.
+                # Run the assigned item before asking for more work, using a different collected
+                # item as nextitem so function fixtures tear down while the session stays warm.
+                next_idx = reply[3] if len(reply) > 3 else None
+                next_selected = items[next_idx] if isinstance(next_idx, int) and 0 <= next_idx < len(items) else None
+                nxt = next_selected if next_selected is not cur else None
+                if nxt is None:
+                    nxt = session_boundary
+                t0 = time.perf_counter()
+                pending = _run_one_item(cur, nxt, collector, full_report=True)
+                busy += time.perf_counter() - t0
+                ran += 1
+                eager_run = True
+                prev = None
+                continue
             if prev is not None:
                 t0 = time.perf_counter()
                 pending = _run_one_item(prev, cur, collector, full_report=True)
@@ -1440,6 +1479,7 @@ class Daemon:
                     report_conn=None,
                     full_report=full_report,
                     detailed=detailed,
+                    stop_on_failure=False,
                 )
                 rc = rc or run_rc
                 summaries.append(summary)
@@ -1492,6 +1532,7 @@ class Daemon:
         selection: list[str] | None,
         progress_conn: socket.socket | None,
         report_conn: socket.socket | None,
+        stop_on_failure: bool,
     ) -> _RunOutcome:
         """One run over the WARM pool: hand each worker item indices (work-stealing), send 'flush' when
         the queue drains, stream reports, collect results + per-run stats. Workers stay alive after
@@ -1501,13 +1542,31 @@ class Daemon:
         if selection is not None and pool.nodeids is not None:
             idx_of = {nid: i for i, nid in enumerate(pool.nodeids)}
             pick_list = [idx_of[n] for n in selection if n in idx_of]
-        total = len(pick_list) if pick_list is not None else pool.total
+        planned_total = len(pick_list) if pick_list is not None else pool.total
         results: list[RunResult] = []
         worker_stats: list[WorkerStats] = []
         flushed: set[socket.socket] = set()
         done: set[socket.socket] = set()
+        reserved: dict[socket.socket, int] = {}
         queue_pos = 0
+        dispatched_total = 0
+        stop_dispatch = False
         tx = rx = req_count = 0
+
+        def pick_at(position: int) -> int | None:
+            if stop_dispatch or position >= planned_total:
+                return None
+            if pick_list is not None:
+                return pick_list[position]
+            return position
+
+        def reserve_next() -> int | None:
+            nonlocal queue_pos
+            pick = pick_at(queue_pos)
+            if pick is not None:
+                queue_pos += 1
+            return pick
+
         sel = selectors.DefaultSelector()
         for conn in pool.conns:
             sel.register(conn, selectors.EVENT_READ)
@@ -1520,6 +1579,7 @@ class Daemon:
                     rx += nbytes
                     if not isinstance(msg, tuple) or not msg:
                         done.add(conn)  # worker died → result undercount flags the run untrusted
+                        reserved.pop(conn, None)
                         sel.unregister(conn)
                         continue
                     parts = cast("tuple[object, ...]", msg)
@@ -1536,20 +1596,26 @@ class Daemon:
                         results.append(result)
                         if progress_conn is not None:
                             with suppress(OSError):
-                                _send(progress_conn, {"progress": (len(results), total)})
+                                _send(progress_conn, {"progress": (len(results), planned_total)})
                         if report_conn is not None:
                             for rep in result.get("reports", []):
                                 with suppress(OSError):
                                     _send(report_conn, {"report": rep})
+                        if stop_on_failure and result["outcome"] in {"failed", "error"}:
+                            stop_dispatch = True
+                            reserved.clear()
                     if conn in flushed:
                         continue  # post-flush last result already shipped; just await run_done
-                    if pick_list is not None:
-                        pick = pick_list[queue_pos] if queue_pos < len(pick_list) else None
-                    else:
-                        pick = queue_pos if total > 0 and queue_pos < total else None
+
+                    pick = None if stop_dispatch else reserved.pop(conn, None)
+                    if pick is None:
+                        pick = reserve_next()
                     if pick is not None:
-                        queue_pos += 1
-                        tx += _send(conn, ("idx", pick))
+                        dispatched_total += 1
+                        next_pick = reserve_next() if stop_on_failure else None
+                        if next_pick is not None:
+                            reserved[conn] = next_pick
+                        tx += _send(conn, ("idx", pick, stop_on_failure, next_pick))
                     else:
                         tx += _send(conn, ("flush",))
                         flushed.add(conn)
@@ -1558,6 +1624,8 @@ class Daemon:
         t_done = time.perf_counter()
         # Workers stay ALIVE (persist) → exitcode None → never 'crashed'; a died worker undercounts results.
         exitcodes = [p.exitcode for p in pool.procs]
+        short_circuited = stop_dispatch and dispatched_total < planned_total
+        total = dispatched_total if short_circuited else planned_total
         return _RunOutcome(
             results=results,
             worker_stats=worker_stats,
@@ -1565,6 +1633,8 @@ class Daemon:
             warmup=t_ready - t0,
             run_wall=t_done - t_ready,
             total=total,
+            planned_total=planned_total,
+            short_circuited=short_circuited,
             idx=1,
             exitcodes=exitcodes,
         )
@@ -1578,9 +1648,24 @@ class Daemon:
         report_conn: socket.socket | None,
         full_report: bool,
         detailed: bool,
+        stop_on_failure: bool,
     ) -> tuple[int, str]:
         """Serve a single `run` request against the warm pool, render its summary (workers stay warm)."""
-        o = self._dispatch_persist(pool, selection=selection, progress_conn=progress_conn, report_conn=report_conn)
+        if selection is not None:
+            collected = set(pool.nodeids or ())
+            missing = list(dict.fromkeys(nodeid for nodeid in selection if nodeid not in collected))
+            if missing:
+                self._last_outcome = None
+                preview = ", ".join(missing[:5])
+                suffix = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+                return 2, f"[pytest-fast] unknown selected nodeid(s): {preview}{suffix}"
+        o = self._dispatch_persist(
+            pool,
+            selection=selection,
+            progress_conn=progress_conn,
+            report_conn=report_conn,
+            stop_on_failure=stop_on_failure,
+        )
         self._last_outcome = o
         summary = self._report(
             o.results,
@@ -1632,6 +1717,7 @@ class Daemon:
         Control protocol (one message per connect, serialized by the accept loop —
         which is why it never tears an active run apart):
           * ('run', fp)            → stale check (mtime+env fp), then run + stream + summary;
+            trailing fresh_workers retires the persistent pool and uses a new worker for this request;
           * ('status', fp)         → {'ready': True, 'stale': bool} (cheap, for watcher/client);
           * ('shutdown',)          → {'bye': True} and exit (watcher shuts the old one AFTER its run);
           * ('promote', new_addr)  → rebind to new_addr (staging→canonical on promote).
@@ -1731,10 +1817,11 @@ class Daemon:
                         return 0  # finally releases the socket → client spawns a fresh daemon
                     # Optional args: ('run', fp, full_report[, stream[, nodeids[, detailed[, bench
                     # [, want_results]]]]]). Old clients send a shorter tuple → positional defaults;
-                    # newer clients' extra elements are simply not read by an older daemon (both
-                    # directions stay compatible). `stream` (the plugin controller) asks the daemon to
-                    # stream the serialized per-phase reports back; `nodeids` (the controller's
-                    # collected set) restricts the run to that selection.
+                    # newer clients' extra elements are simply not read by an older daemon. `stream`
+                    # (the plugin controller) asks the daemon to stream the serialized per-phase
+                    # reports back; `nodeids` (the controller's collected set) restricts the run to
+                    # that selection. Execution-mode fields are deliberate exceptions to silent compatibility:
+                    # their clients require acknowledgements in the final frame.
                     full_report = bool(fp_args[1]) if len(fp_args) > 1 else False
                     stream = len(fp_args) > 2 and bool(fp_args[2])
                     selection = (
@@ -1749,8 +1836,69 @@ class Daemon:
                     # `want_results` (wrapper clients): also ship the run's lean per-test results +
                     # worker stats + run meta in the final frame. See `request_run(want_results=...)`.
                     want_results = len(fp_args) > 6 and bool(fp_args[6])
+                    # `stop_on_failure` is a persistent-pool scheduler contract: do not dispatch a
+                    # new selected item after an observed failed/error result. It trails every older
+                    # field so old clients and daemons keep their existing behavior.
+                    stop_on_failure = len(fp_args) > 7 and bool(fp_args[7])
+                    # `fresh_workers` retires an existing persistent pool and executes this request
+                    # with the fork-per-request path while keeping the collected controller alive.
+                    fresh_workers = len(fp_args) > 8 and bool(fp_args[8])
                     self._last_outcome = None  # a mode that doesn't produce one must not ship a stale one
-                    if self.persist_workers and bench == 0:
+                    if fresh_workers and stop_on_failure:
+                        _try_send(
+                            conn,
+                            {
+                                "rc": 2,
+                                "summary": "[pytest-fast] fresh_workers cannot be combined with stop_on_failure",
+                                "stop_on_failure": True,
+                                "fresh_workers": True,
+                            },
+                        )
+                        continue
+                    if fresh_workers and bench > 0:
+                        _try_send(
+                            conn,
+                            {
+                                "rc": 2,
+                                "summary": "[pytest-fast] fresh_workers cannot be combined with bench",
+                                "fresh_workers": True,
+                            },
+                        )
+                        continue
+                    if stop_on_failure and bench > 0:
+                        _try_send(
+                            conn,
+                            {
+                                "rc": 2,
+                                "summary": "[pytest-fast] stop_on_failure cannot be combined with bench",
+                                "stop_on_failure": True,
+                            },
+                        )
+                        continue
+                    if stop_on_failure and not self.persist_workers:
+                        _try_send(
+                            conn,
+                            {
+                                "rc": 2,
+                                "summary": "[pytest-fast] stop_on_failure requires a --persist-workers daemon",
+                                "stop_on_failure": True,
+                            },
+                        )
+                        continue
+                    if fresh_workers:
+                        if pool is not None:
+                            self._teardown_persist_pool(pool)
+                            pool = None
+                        if stream:
+                            rc, summary = self._run_once(full_report=True, report_conn=conn, selection=selection)
+                        else:
+                            rc, summary = self._run_once(
+                                progress_conn=conn,
+                                full_report=full_report,
+                                selection=selection,
+                                detailed=detailed,
+                            )
+                    elif self.persist_workers and bench == 0:
                         # Warm pool: fork once (lazily), reuse across requests → session fixtures set up
                         # once. Always capture nodeids so any request's selection resolves to indices.
                         if pool is None:
@@ -1763,6 +1911,7 @@ class Daemon:
                                 report_conn=conn,
                                 full_report=True,
                                 detailed=False,
+                                stop_on_failure=stop_on_failure,
                             )
                         else:
                             rc, summary = self._run_persist_request(
@@ -1772,6 +1921,7 @@ class Daemon:
                                 report_conn=None,
                                 full_report=full_report,
                                 detailed=detailed,
+                                stop_on_failure=stop_on_failure,
                             )
                     elif stream:
                         # Controller renders natively from the streamed reports → no daemon-side
@@ -1783,14 +1933,25 @@ class Daemon:
                         # progress_conn=conn: workers write dots into the DAEMON log, not the
                         # client's terminal — so we stream progress over this same socket
                         # (otherwise the client sits silent the whole run and looks frozen).
-                        rc, summary = self._run_once(progress_conn=conn, full_report=full_report, detailed=detailed)
+                        rc, summary = self._run_once(
+                            progress_conn=conn,
+                            full_report=full_report,
+                            selection=selection,
+                            detailed=detailed,
+                        )
                     final_frame: dict[str, object] = {"rc": rc, "summary": summary}
+                    if stop_on_failure:
+                        final_frame["stop_on_failure"] = True
+                    if fresh_workers:
+                        final_frame["fresh_workers"] = True
                     if want_results and self._last_outcome is not None:
                         o = self._last_outcome
                         final_frame["results"] = _lean_results(o.results)
                         final_frame["worker_stats"] = o.worker_stats
                         final_frame["run_meta"] = {
                             "total": o.total,
+                            "planned_total": o.planned_total,
+                            "short_circuited": o.short_circuited,
                             "warmup": o.warmup,
                             "run_wall": o.run_wall,
                             "num_workers": self.num_workers,
@@ -1885,6 +2046,8 @@ class Daemon:
             warmup=t_ready - t0,
             run_wall=t_done - t_ready,
             total=total,
+            planned_total=total,
+            short_circuited=False,
             idx=idx,
             exitcodes=[p.exitcode for p in procs],
         )
@@ -1893,10 +2056,14 @@ class Daemon:
     def _run_untrusted(o: _RunOutcome) -> bool:
         """A worker may die BEFORE sending results (import/assert in `_worker_main`) → results are
         partial and rc would be a false green (possibly n=0/0). A non-zero worker exitcode OR a
-        result undercount (< collected total) → the run is NOT trusted."""
+        result undercount (< dispatched total) → the run is NOT trusted. The only trusted planned
+        shortfall is a stop-first run backed by an observed failed/error result."""
         crashed = any(code not in (0, None) for code in o.exitcodes)
         incomplete = o.total > 0 and len(o.results) < o.total
-        return crashed or incomplete
+        observed_failure = any(result["outcome"] in {"failed", "error"} for result in o.results)
+        invalid_short_circuit = o.short_circuited and (not observed_failure or o.total >= o.planned_total)
+        unexplained_shortfall = o.total < o.planned_total and not o.short_circuited
+        return crashed or incomplete or invalid_short_circuit or unexplained_shortfall
 
     def _run_once(
         self,
@@ -1921,6 +2088,10 @@ class Daemon:
             full_report=full_report,
             detailed=detailed,
         )
+        if selection is not None and o.total != len(selection):
+            self._last_outcome = None
+            missing_count = len(selection) - o.total
+            return 2, f"{summary}\n[pytest-fast] {missing_count} unknown selected nodeid(s)"
         rc = 1 if any(r["outcome"] in {"failed", "error"} for r in o.results) else 0
         if self._run_untrusted(o):
             rc = 1
@@ -2012,6 +2183,7 @@ class Daemon:
             # nodeids), pick_list holds the daemon-side item indices to actually run, built from
             # the first worker 'ready' that carries the nodeid list. None → run the full suite.
             pick_list: list[int] | None = None
+            selection_known_total: int | None = None
             queue_pos = 0
             results: list[RunResult] = []
             worker_stats: list[WorkerStats] = []
@@ -2069,12 +2241,14 @@ class Daemon:
                     if kind == "ready":
                         total = cast("int", parts[2])
                         # Selection mode: resolve the controller's nodeids → daemon item indices
-                        # from the first 'ready' that carries the worker's nodeid list. Unknown
-                        # nodeids (not in this daemon's collection) are dropped — the controller's
-                        # collection-match guard reports them.
+                        # from the first 'ready' that carries the worker's nodeid list. A mixed
+                        # known/unknown request must be rejected before any known item runs: test
+                        # setup can mutate external state even though the final protocol rc is 2.
                         if selection is not None and pick_list is None and len(parts) > 4 and parts[4] is not None:
                             idx_of = {nid: i for i, nid in enumerate(cast("list[str]", parts[4]))}
-                            pick_list = [idx_of[n] for n in selection if n in idx_of]
+                            valid_picks = [idx_of[n] for n in selection if n in idx_of]
+                            selection_known_total = len(valid_picks)
+                            pick_list = [] if len(valid_picks) != len(selection) else valid_picks
                         ready_seen += 1
                         if ready_seen == expected:
                             t_ready = time.perf_counter()
@@ -2113,7 +2287,7 @@ class Daemon:
 
             emit_progress(force=True)  # final frame (done==target) — guaranteed
             bus = {"tx": float(tx), "rx": float(rx), "req_count": float(req_count)}
-            run_total = len(pick_list) if pick_list is not None else (total or 0)
+            run_total = selection_known_total if selection_known_total is not None else (total or 0)
             return results, worker_stats, bus, t_ready, run_total
         finally:
             sel.close()
@@ -2264,6 +2438,26 @@ def _lean_results(results: list[RunResult]) -> list[RunResult]:
 # ── client-side: request a run from the resident daemon ──────────────────────
 
 
+def _validate_stop_on_failure_ack(frame: dict[str, object], *, requested: bool) -> dict[str, object]:
+    """Reject a completed response from a daemon that cannot prove stop-first support."""
+    if requested and frame.get("stale") is not True and frame.get("stop_on_failure") is not True:
+        return {
+            "rc": 2,
+            "summary": "[pytest-fast] daemon does not support stop_on_failure; restart it with pytest-fast >=0.14",
+        }
+    return frame
+
+
+def _validate_fresh_workers_ack(frame: dict[str, object], *, requested: bool) -> dict[str, object]:
+    """Reject a completed response from a daemon that cannot prove fresh-worker support."""
+    if requested and frame.get("stale") is not True and frame.get("fresh_workers") is not True:
+        return {
+            "rc": 2,
+            "summary": "[pytest-fast] daemon does not support fresh_workers; restart it with pytest-fast >=0.15",
+        }
+    return frame
+
+
 def request_run(
     address: str,
     *,
@@ -2271,6 +2465,9 @@ def request_run(
     detailed: bool = False,
     bench: int = 0,
     want_results: bool = False,
+    nodeids: list[str] | None = None,
+    stop_on_failure: bool = False,
+    fresh_workers: bool = False,
 ) -> dict[str, object]:
     """Trigger a run on the daemon; stream progress to stdout, return the final frame
     (`{rc, summary}` or `{stale: True}`). The daemon sends N `{'progress': (done,total)}`
@@ -2286,17 +2483,58 @@ def request_run(
     ({total, warmup, run_wall, num_workers, start_method}). ~100 bytes/test on the wire. A daemon
     predating the flag returns the plain `{rc, summary}` frame — treat the keys as optional.
 
+    `nodeids` restricts the request to an ordered selection. `stop_on_failure` asks a persistent
+    worker pool to stop dispatching that selection after the first observed failed/error result.
+    The latter intentionally requires a daemon started with `--persist-workers`: a non-persistent
+    daemon, a benchmark request, or a daemon predating the acknowledged contract returns rc=2 instead
+    of silently running a different contract.
+
+    `fresh_workers` retires an existing persistent pool and runs this request in a newly forked worker
+    while retaining the daemon's collected controller. Each fresh request gets a new pytest session.
+    It cannot be combined with stop-first or benchmark mode and also requires an explicit daemon ack.
+
     Module-level (not a method of `Daemon`) — this is the **client**, not a server
     method; keeping it on `Daemon` would mix both protocol sides into one class."""
+    if bench > 0 and stop_on_failure:
+        return {
+            "rc": 2,
+            "summary": "[pytest-fast] stop_on_failure cannot be combined with bench",
+        }
+    if fresh_workers and stop_on_failure:
+        return {
+            "rc": 2,
+            "summary": "[pytest-fast] fresh_workers cannot be combined with stop_on_failure",
+        }
+    if fresh_workers and bench > 0:
+        return {
+            "rc": 2,
+            "summary": "[pytest-fast] fresh_workers cannot be combined with bench",
+        }
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     with _short_unix_path(address) as connect_path:
         sock.connect(connect_path)
     with sock:
-        # ('run', fp, full_report, stream, nodeids, detailed, bench, want_results) — non-streamed
+        # ('run', fp, full_report, stream, nodeids, detailed, bench, want_results,
+        # stop_on_failure, fresh_workers) — non-streamed
         # CLI run, so stream=False / nodeids=None; `bench` (an int run-count, 0=off) makes the daemon
         # render the bottleneck report (it forces full reports itself). Trailing elements are ignored
-        # by a daemon predating them (back-compatible).
-        _send(sock, ("run", _env_fingerprint(), full_report, False, None, detailed, bench, want_results))
+        # by a daemon predating them. Execution-mode responses are accepted only with explicit
+        # acknowledgements, so an older daemon cannot silently weaken those contracts.
+        _send(
+            sock,
+            (
+                "run",
+                _env_fingerprint(),
+                full_report,
+                False,
+                nodeids,
+                detailed,
+                bench,
+                want_results,
+                stop_on_failure,
+                fresh_workers,
+            ),
+        )
         while True:
             raw, _ = _recv(sock)
             if not isinstance(raw, dict):
@@ -2307,11 +2545,17 @@ def request_run(
                 print(f"\r  running {done}/{total} …", end="", flush=True)
                 continue
             print("\r" + " " * 32 + "\r", end="", flush=True)  # erase the progress line
-            return frame
+            frame = _validate_stop_on_failure_ack(frame, requested=stop_on_failure)
+            return _validate_fresh_workers_ack(frame, requested=fresh_workers)
 
 
 def request_run_streamed(
-    address: str, on_report: Callable[[dict[str, object]], None], nodeids: list[str] | None = None
+    address: str,
+    on_report: Callable[[dict[str, object]], None],
+    nodeids: list[str] | None = None,
+    *,
+    stop_on_failure: bool = False,
+    fresh_workers: bool = False,
 ) -> dict[str, object]:
     """Client for full-report **streaming** (the `pytest --fast` plugin controller). Triggers a
     run in stream mode, invokes `on_report(serialized_report)` for each per-phase report as it
@@ -2320,6 +2564,8 @@ def request_run_streamed(
     `nodeids` restricts the run to the controller's collected selection (so -k/-m/paths work);
     None runs the daemon's full suite.
 
+    `stop_on_failure` and `fresh_workers` have the same contracts as in `request_run`.
+
     The controller replays the streamed reports through its own real terminalreporter, so native
     pytest reporting (--durations / junit / -v/-s / plugins) all work — while the warm forkserver
     daemon does the actual execution (amortized collect, fork-warm workers)."""
@@ -2327,7 +2573,12 @@ def request_run_streamed(
     with _short_unix_path(address) as connect_path:
         sock.connect(connect_path)
     with sock:
-        _send(sock, ("run", _env_fingerprint(), True, True, nodeids))  # full_report + stream + selection
+        # Fill the older trailing fields so execution modes remain backward-compatible tuple tails:
+        # full_report, stream, selection, detailed, bench, want_results, stop, fresh.
+        _send(
+            sock,
+            ("run", _env_fingerprint(), True, True, nodeids, False, 0, False, stop_on_failure, fresh_workers),
+        )
         while True:
             raw, _ = _recv(sock)
             if not isinstance(raw, dict):
@@ -2337,7 +2588,8 @@ def request_run_streamed(
             if rep is not None:
                 on_report(cast("dict[str, object]", rep))
                 continue
-            return frame  # stale | {rc, summary}
+            frame = _validate_stop_on_failure_ack(frame, requested=stop_on_failure)
+            return _validate_fresh_workers_ack(frame, requested=fresh_workers)
 
 
 # ── orchestration: ensure resident daemon + run / stale-restart ──────────────

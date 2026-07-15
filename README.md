@@ -395,6 +395,53 @@ next run — which is why it's opt-in. The saving is the whole session-fixture s
 with how expensive that fixture is and how many runs you issue, so it's largest for a long stream of
 small runs against a heavyweight session fixture (a DB engine + schema seed, an app factory).
 
+Wrapper clients can also make an ordered persistent request stop at the first observed test failure:
+
+```python
+from pytest_fast import request_run
+
+frame = request_run(
+    "/tmp/my.sock",
+    nodeids=["tests/test_x.py::test_likely_killer", "tests/test_x.py::test_fallback"],
+    stop_on_failure=True,
+    want_results=True,
+)
+```
+
+The daemon must be started with `--persist-workers`. A one-worker pool gives strict first-failure
+execution; with multiple workers, already-dispatched items finish but no new item is issued. A trusted
+short-circuit reports the executed count as `run_meta["total"]`, the original selection as
+`run_meta["planned_total"]`, and `run_meta["short_circuited"] = True`. The scheduler never invents a
+failure: an early run is trusted only when a real `failed`/`error` result was received. The streaming
+client exposes the same keyword for tools that consume per-phase reports:
+`request_run_streamed(addr, on_report, nodeids, stop_on_failure=True)`.
+
+Stop-first requires pytest-fast 0.14+ on both protocol sides. The daemon acknowledges the contract in
+its final frame; a client rejects an older daemon's unacknowledged response with `rc=2`. Benchmark mode
+cannot be combined with `stop_on_failure`, because a benchmark is defined as complete repeated runs.
+
+Tools that need an occasional isolated retry can retire the persistent sessions while preserving the
+daemon's completed collection:
+
+```python
+frame = request_run(
+    "/tmp/my.sock",
+    nodeids=["tests/test_x.py::test_x"],
+    fresh_workers=True,
+)
+```
+
+Every `fresh_workers=True` request forks a new worker and tears its pytest session down at the request
+boundary. The first such request also stops the resident worker pool; a later ordinary request lazily
+creates a new persistent pool. An empty selection is a cheap barrier for tools that must close session
+resources before resetting an external database. Collection and the clean forkserver controller remain
+resident throughout. The daemon acknowledges this contract, and a 0.15+ client rejects an older daemon's
+unacknowledged response. Fresh-worker mode cannot be combined with `stop_on_failure` or benchmark mode.
+
+Both persistent and fork-per-request selections fail closed when a requested nodeid is absent from the
+daemon's collection. The final frame uses `rc=2`; an unknown selection is never treated as an empty or
+partial green run.
+
 ---
 
 ## Extending pytest-fast (0.12+): wrappers & plugins
