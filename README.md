@@ -435,7 +435,7 @@ Every `fresh_workers=True` request forks a new worker and tears its pytest sessi
 boundary. The first such request also stops the resident worker pool; a later ordinary request lazily
 creates a new persistent pool. An empty selection is a cheap barrier for tools that must close session
 resources before resetting an external database. Collection and the clean forkserver controller remain
-resident throughout. The daemon acknowledges this contract, and a 0.15+ client rejects an older daemon's
+resident throughout. The daemon acknowledges this contract, and a 0.14+ client rejects an older daemon's
 unacknowledged response. Fresh-worker mode cannot be combined with `stop_on_failure` or benchmark mode.
 
 Both persistent and fork-per-request selections fail closed when a requested nodeid is absent from the
