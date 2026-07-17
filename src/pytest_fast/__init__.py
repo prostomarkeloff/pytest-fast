@@ -84,7 +84,7 @@ if TYPE_CHECKING:
     from _pytest.config.argparsing import Parser
     from _pytest.main import Session
     from _pytest.nodes import Item
-    from _pytest.reports import TestReport
+    from _pytest.reports import CollectReport, TestReport
 
     class _WorkerConfig(Protocol):
         """The xdist-style worker attributes we graft onto a configured `Config` post-fork.
@@ -648,6 +648,13 @@ class _ReportCollector:
 # cross-module private-access; ALL_CAPS — reportConstantRedefinition on reassign.
 collected_config: Config | None = None
 collected_items: list[Item] = []
+# Collection errors (nodeid, longrepr text) captured during `_collect()` — e.g. a test
+# module that fails to import. pytest quietly drops such files from `session.items`;
+# without surfacing these, the daemon would serve a SHORTER suite while looking green
+# (observed in the wild: 2 files with ImportError → n dropped silently, no error, rc=0).
+# Workers ship this list to the daemon in their one-time 'ready' frame; the daemon
+# renders a `collect-errors` summary block and forces a non-zero rc.
+collected_errors: list[tuple[str, str]] = []
 
 
 # Seconds: after this long inside `_collect()` the watchdog thread prints all-threads
@@ -658,8 +665,21 @@ collected_items: list[Item] = []
 _COLLECT_WATCHDOG_TIMEOUT = 30.0
 
 
+class _CollectErrorRecorder:
+    """Collection-time plugin: record failed collect reports (import errors, syntax
+    errors, broken fixtures at module scope). These never make it into `session.items`,
+    so they are invisible to the run loop — this recorder is their only witness."""
+
+    def __init__(self) -> None:
+        self.errors: list[tuple[str, str]] = []
+
+    def pytest_collectreport(self, report: CollectReport) -> None:
+        if report.failed:
+            self.errors.append((report.nodeid, report.longreprtext))
+
+
 def _collect() -> None:
-    global collected_config, collected_items
+    global collected_config, collected_items, collected_errors
     import faulthandler
     import gc
     import importlib.util
@@ -700,8 +720,14 @@ def _collect() -> None:
         config.hook.pytest_configure.call_historic(kwargs={"config": config})
         session = pytest.Session.from_config(config)
         config.hook.pytest_sessionstart(session=session)
+        # Witness collection failures: a module that fails to import is silently absent
+        # from `session.items` — without this recorder the daemon would serve the
+        # shortened suite as if nothing happened (green run, quietly missing tests).
+        error_recorder = _CollectErrorRecorder()
+        config.pluginmanager.register(error_recorder)
         config.hook.pytest_collection(session=session)
         collected_config, collected_items = config, session.items
+        collected_errors = error_recorder.errors
         # Reap collect-time cyclic garbage BEFORE freezing. Importing test modules leaves
         # transient garbage that only cyclic GC reclaims — notably stale pre-slots classes
         # from `@attrs.define`/`@dataclass(slots=True)`, which linger as DUPLICATES in their
@@ -1138,7 +1164,7 @@ def _worker_main(
     # In selection mode the master needs nodeid→index to run a subset; ship the nodeid list
     # once per worker in 'ready' (None otherwise → lean).
     ready_nodeids = [it.nodeid for it in items] if send_nodeids else None
-    _send(sock, ("ready", wid, len(items), collect_wall, ready_nodeids))
+    _send(sock, ("ready", wid, len(items), collect_wall, ready_nodeids, pytest_fast.collected_errors))
 
     # Per-test hang watchdog: when `PYTEST_FAST_WORKER_HANG_TIMEOUT` > 0, arm a
     # `faulthandler` timer before each `_run_one_item` and cancel it after the test
@@ -1279,7 +1305,7 @@ def _worker_persist_main(
         else None
     )
     ready_nodeids = [it.nodeid for it in items] if send_nodeids else None
-    _send(sock, ("ready", wid, len(items), collect_wall, ready_nodeids))
+    _send(sock, ("ready", wid, len(items), collect_wall, ready_nodeids, pytest_fast.collected_errors))
 
     stop = False
     while not stop:  # spans runs — session persists across this outer loop
@@ -1420,6 +1446,11 @@ class Daemon:
         # serve loop). Reset before each request; left None by modes that don't produce a single
         # canonical outcome (bench).
         self._last_outcome: _RunOutcome | None = None
+        # Collection errors reported by workers in their 'ready' frame (static per boot —
+        # collect runs once in the forkserver preload, which is a DIFFERENT process from
+        # this daemon, so the bus is the only channel). Rendered as the `collect-errors`
+        # summary block and forcing rc=1: a silently shortened suite must never look green.
+        self._collect_errors: list[tuple[str, str]] = []
         # The `_PYTEST_FAST_COLLECT` flag is NOT set here on purpose — it's a global
         # side effect that would leak into env even if the object is built but not used.
         # We set it immediately before the first `Process.start()` (see `_arm_collect_flag`),
@@ -1516,12 +1547,14 @@ class Daemon:
         server.settimeout(_WORKER_ACCEPT_TIMEOUT)
         for _ in range(self.num_workers):
             conn, _addr = server.accept()
-            msg, _ = _recv(conn)  # ('ready', wid, count, collect_wall, nodeids)
+            msg, _ = _recv(conn)  # ('ready', wid, count, collect_wall, nodeids, collect_errors)
             conns.append(conn)
             if isinstance(msg, tuple) and len(msg) >= 5 and msg[0] == "ready":
                 total = cast("int", msg[2])
                 if send_nodeids and isinstance(msg[4], list):
                     nodeids = cast("list[str]", msg[4])
+                if len(msg) > 5 and isinstance(msg[5], list):
+                    self._collect_errors = cast("list[tuple[str, str]]", msg[5])
         server.settimeout(None)
         return _PersistPool(server=server, sock_path=sock_path, procs=procs, conns=conns, total=total, nodeids=nodeids)
 
@@ -1678,7 +1711,7 @@ class Daemon:
             full_report=full_report,
             detailed=detailed,
         )
-        rc = 1 if any(r["outcome"] in {"failed", "error"} for r in o.results) else 0
+        rc = 1 if self._collect_errors or any(r["outcome"] in {"failed", "error"} for r in o.results) else 0
         if self._run_untrusted(o):
             rc = 1
             summary += (
@@ -2092,7 +2125,7 @@ class Daemon:
             self._last_outcome = None
             missing_count = len(selection) - o.total
             return 2, f"{summary}\n[pytest-fast] {missing_count} unknown selected nodeid(s)"
-        rc = 1 if any(r["outcome"] in {"failed", "error"} for r in o.results) else 0
+        rc = 1 if self._collect_errors or any(r["outcome"] in {"failed", "error"} for r in o.results) else 0
         if self._run_untrusted(o):
             rc = 1
             summary += (
@@ -2124,7 +2157,8 @@ class Daemon:
         )
         rc = (
             1
-            if any(self._run_untrusted(o) or any(r["outcome"] in {"failed", "error"} for r in o.results) for o in runs)
+            if self._collect_errors
+            or any(self._run_untrusted(o) or any(r["outcome"] in {"failed", "error"} for r in o.results) for o in runs)
             else 0
         )
         return rc, summary
@@ -2240,6 +2274,8 @@ class Daemon:
                     kind = parts[0]
                     if kind == "ready":
                         total = cast("int", parts[2])
+                        if len(parts) > 5 and isinstance(parts[5], list):
+                            self._collect_errors = cast("list[tuple[str, str]]", parts[5])
                         # Selection mode: resolve the controller's nodeids → daemon item indices
                         # from the first 'ready' that carries the worker's nodeid list. A mixed
                         # known/unknown request must be rejected before any known item runs: test
@@ -2328,6 +2364,8 @@ class Daemon:
             "num_workers": self.num_workers,
             "start_method": self.start_method,
             "label": label,
+            # Additive (0.15): collection failures of this daemon boot — (nodeid, longrepr).
+            "collect_errors": list(self._collect_errors),
         }
         blocks = _apply_daemon_plugins(run_info, blocks)
         return "\n".join(ln for block in blocks for ln in block["lines"])
@@ -2346,7 +2384,7 @@ class Daemon:
         detailed: bool,
     ) -> list[SummaryBlock]:
         """The DEFAULT summary as named blocks (stable names — the plugin-facing contract):
-        `top`, `results`, `warmup`, `run`, `par`, [`detailed`], `bus`, [`failures`], [`xpass`],
+        `top`, `results`, [`collect-errors`], `warmup`, `run`, `par`, [`detailed`], `bus`, [`failures`], [`xpass`],
         [`durations` (full-report) | `slowest` (lean)], `bottom`. Conditional blocks are simply
         absent when empty. Flattened output is byte-identical to the pre-block renderer."""
         from collections import Counter
@@ -2378,6 +2416,17 @@ class Daemon:
                 ],
             },
         ]
+        if self._collect_errors:
+            # Right under `results` (index 2): n above counts only COLLECTED tests — these
+            # files never made it into the suite at all, which is exactly why the block is loud.
+            error_lines = [
+                f"  COLLECT ERRORS ({len(self._collect_errors)}) — files not collected, their tests DID NOT RUN:"
+            ]
+            for nodeid, longrepr in self._collect_errors:
+                error_lines.append(f"    ✗ {nodeid}")
+                if longrepr.strip():
+                    error_lines.extend(f"      {ln}" for ln in longrepr.splitlines())
+            blocks.insert(2, {"name": "collect-errors", "lines": error_lines})
         if detailed:
             metrics = _parallelism_metrics(worker_stats, run, self.num_workers, results)
             # cores = perf-core count (the throughput baseline + the default worker count);

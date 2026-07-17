@@ -77,7 +77,15 @@ def test_categorize_only_ever_returns_a_known_bucket(cats: list[str]) -> None:
     assert categorize(config, reports) in _KNOWN_OUTCOMES
 
 
-@given(known=st.sampled_from(sorted(_KNOWN_OUTCOMES)), noise=st.lists(st.text() | st.just("rerun") | st.just("")))
+# Noise = strings categorize must IGNORE. `st.text()` can randomly produce a KNOWN
+# outcome (hypothesis found `noise=['failed']` around `known='passed'` — and 'failed'
+# legitimately outranks 'passed', which is categorize working as designed, not noise
+# being ignored). The invariant's domain is genuinely-unknown strings — filter, don't
+# weaken the assert.
+_noise = st.text().filter(lambda s: s not in _KNOWN_OUTCOMES) | st.just("rerun") | st.just("")
+
+
+@given(known=st.sampled_from(sorted(_KNOWN_OUTCOMES)), noise=st.lists(_noise))
 def test_categorize_ignores_noise_around_a_known_category(known: str, noise: list[str]) -> None:
     """A single legitimate category surrounded by unknown/empty/'rerun' noise must
     still produce a real bucket — never an unknown string and never 'passed' demotion
@@ -89,6 +97,14 @@ def test_categorize_ignores_noise_around_a_known_category(known: str, noise: lis
     assert result in _KNOWN_OUTCOMES
     # `known` (the only recognized one) should win over all the noise.
     assert result == known
+
+
+def test_categorize_significance_beats_order() -> None:
+    """Pin the edge hypothesis surfaced: two KNOWN categories are NOT noise-vs-known —
+    the more significant one wins regardless of position ('failed' over 'passed')."""
+    config = cast("Config", _FakeConfig(["failed", "passed"]))
+    reports = cast("list[TestReport]", [object(), object()])
+    assert categorize(config, reports) == "failed"
 
 
 # ── _durations_lines: robust against malformed serialized reports ────────────────

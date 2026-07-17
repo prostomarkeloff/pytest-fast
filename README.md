@@ -442,6 +442,14 @@ Both persistent and fork-per-request selections fail closed when a requested nod
 daemon's collection. The final frame uses `rc=2`; an unknown selection is never treated as an empty or
 partial green run.
 
+**Collection errors fail closed too (0.15+).** A test module that fails to import (ImportError, syntax
+error, broken module-scope fixture) is silently absent from pytest's collected items — before 0.15 the
+daemon would serve the shortened suite as if nothing happened: green summary, `n` quietly smaller, rc=0.
+Now the collect-time failures are captured in the forkserver preload, shipped to the daemon with the
+workers' `ready` frame, rendered as a loud `COLLECT ERRORS (N)` block (with tracebacks) right under
+`results :`, and force `rc=1` on every run served by that boot. The successfully collected tests still
+run — you get the full remaining suite AND a red, attributed verdict, instead of a silent gap.
+
 ---
 
 ## Extending pytest-fast (0.12+): wrappers & plugins
@@ -473,8 +481,8 @@ the daemon log, never a failed test. Per-test **CPU time is already built in**: 
 The daemon holds every run's aggregated data but (by architecture) no pytest session — collection
 lives in the forkserver preload. So daemon-side extensions are **plain modules**, named in
 `PYTEST_FAST_DAEMON_PLUGINS` (comma-separated import paths). The summary box is rendered as a list
-of **named blocks** — `top`, `results`, `warmup`, `run`, `par`, [`detailed`], `bus`, [`failures`],
-[`xpass`], [`durations` (full-report) | `slowest` (lean)], `bottom` — and a plugin may implement the
+of **named blocks** — `top`, `results`, [`collect-errors`], `warmup`, `run`, `par`, [`detailed`], `bus`,
+[`failures`], [`xpass`], [`durations` (full-report) | `slowest` (lean)], `bottom` — and a plugin may implement the
 additive hook, the full-control hook, or both:
 
 ```python
@@ -496,7 +504,8 @@ def pytest_fast_render_summary(run_info, blocks):
 Plugins run in env-list order, each `render_summary` seeing the previous one's output (a pipeline);
 returning `None` keeps the (possibly mutated in place) layout. `run_info` keys: `results` (list of
 `RunResult` — nodeid/outcome/duration/cpu/extra/…), `worker_stats`, `bus`, `total`, `warmup`,
-`run_wall`, `num_workers`, `start_method`, `label`.
+`run_wall`, `num_workers`, `start_method`, `label`, `collect_errors` (0.15+: list of `(nodeid,
+longrepr)` for files that failed collection this daemon boot).
 
 Failure policy: import errors / missing hooks / raising plugins / malformed render returns become a
 visible `⚠` line in a `plugin-errors` block — never a crashed daemon, never a silently-missing gate.
