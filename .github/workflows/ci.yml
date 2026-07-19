@@ -58,6 +58,8 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: make test-full
         shell: bash
+        env:
+          UV_NO_SYNC: "1"
       - name: Skip on Windows (POSIX-only deps — future work)
         if: matrix.os == 'windows-latest'
         run: |
@@ -88,6 +90,8 @@ jobs:
       - name: Run fuzz + stress tier
         run: make test-stress
         shell: bash
+        env:
+          UV_NO_SYNC: "1"
 
   # Atheris coverage-guided fuzzing of the wire decoder. Non-deterministic, so it does NOT
   # gate PRs (the deterministic corpus replay in the `stress` job covers those). Runs on
@@ -151,3 +155,5 @@ jobs:
       - name: Run parity tier
         run: make test-parity
         shell: bash
+        env:
+          UV_NO_SYNC: "1"
