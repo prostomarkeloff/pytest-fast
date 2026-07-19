@@ -378,6 +378,28 @@ def _make_process_exit_project(root: Path) -> None:
     )
 
 
+def _make_duplicate_process_exit_project(root: Path, marker: Path) -> None:
+    """Project whose repeated item exits the worker only on its second execution."""
+    (root / "tests").mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "duplicate-process-exit"\nversion = "0"\n\n'
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'
+    )
+    (root / "tests" / "test_exit.py").write_text(
+        textwrap.dedent(f"""
+        import os
+        from pathlib import Path
+
+        MARKER = Path({str(marker)!r})
+
+        def test_process_exit_on_second_execution():
+            if MARKER.exists():
+                os._exit(17)
+            MARKER.write_text("first execution completed", encoding="utf-8")
+        """)
+    )
+
+
 @pytest.mark.parametrize("fresh_workers", [False, True])
 def test_compact_run_reports_exact_active_item_on_worker_exit(
     tmp_path: Path,
@@ -409,6 +431,35 @@ def test_compact_run_reports_exact_active_item_on_worker_exit(
         assert [result["nodeid"] for result in results] == [selected[0]]
         meta = cast("dict[str, object]", reply["run_meta"])
         assert meta["process_failures"] == [selected[1]]
+        assert "UNTRUSTED" in cast("str", reply["summary"])
+    finally:
+        _stop(proc, address)
+
+
+def test_compact_run_reports_repeated_active_item_after_same_nodeid_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed occurrence cannot hide a later crash of the same selected nodeid."""
+    project = tmp_path / "proj"
+    marker = tmp_path / "first-execution-completed"
+    _make_duplicate_process_exit_project(project, marker)
+    address = str(tmp_path / "pf.sock")
+    monkeypatch.setenv("PYTEST_FAST_ROOT", str(project))
+    proc = _spawn_daemon(project, address, "--persist-workers")
+    nodeid = "tests/test_exit.py::test_process_exit_on_second_execution"
+    results: list[RunResult] = []
+    try:
+        assert _await_ready(address, proc, timeout=30.0), "daemon did not become ready"
+        reply = request_run_results(
+            address,
+            results.append,
+            nodeids=[nodeid, nodeid],
+            stop_on_failure=True,
+        )
+        assert reply.get("rc") == 1, reply
+        assert [result["nodeid"] for result in results] == [nodeid]
+        meta = cast("dict[str, object]", reply["run_meta"])
+        assert meta["process_failures"] == [nodeid]
         assert "UNTRUSTED" in cast("str", reply["summary"])
     finally:
         _stop(proc, address)

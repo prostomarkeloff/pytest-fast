@@ -214,19 +214,17 @@ _ACTIVE_ITEM_COMPLETED = -2
 def _process_failure_nodeids(
     active_items: _ActiveItemSlots,
     nodeids: list[str] | None,
-    results: list[RunResult],
 ) -> list[str]:
     """Resolve items whose workers exited while their pytest protocol was active."""
     if nodeids is None:
         return []
-    completed = {result["nodeid"] for result in results}
     failures: list[str] = []
     for slot in range(len(active_items)):
         index = active_items[slot]
         if not isinstance(index, int) or not 0 <= index < len(nodeids):
             continue
         nodeid = nodeids[index]
-        if nodeid not in completed and nodeid not in failures:
+        if nodeid not in failures:
             failures.append(nodeid)
     return failures
 
@@ -1786,7 +1784,7 @@ class Daemon:
             short_circuited=short_circuited,
             idx=1,
             exitcodes=exitcodes,
-            process_failures=_process_failure_nodeids(pool.active_items, pool.nodeids, results),
+            process_failures=_process_failure_nodeids(pool.active_items, pool.nodeids),
         )
 
     def _run_persist_request(
@@ -2517,7 +2515,7 @@ class Daemon:
             bus = {"tx": float(tx), "rx": float(rx), "req_count": float(req_count)}
             run_total = selection_known_total if selection_known_total is not None else (total or 0)
             process_failures = (
-                _process_failure_nodeids(active_items, collected_nodeids, results) if active_items is not None else []
+                _process_failure_nodeids(active_items, collected_nodeids) if active_items is not None else []
             )
             return results, worker_stats, bus, t_ready, run_total, process_failures
         finally:
