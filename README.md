@@ -562,6 +562,9 @@ frame = request_run_results(
 raise SystemExit(int(frame.get("rc", 1)))
 ```
 
+Collection errors reject a compact request before any test item is dispatched, so wrapper tools never
+receive results from a shortened suite.
+
 Protocol compatibility contract: run-request tuples grow positionally (older daemons ignore trailing
 elements), reply frames are dicts (treat unknown keys as optional). A streaming variant with the same
 orchestration: `request_run_streamed(addr, on_report=...)` — every per-phase report as it happens.

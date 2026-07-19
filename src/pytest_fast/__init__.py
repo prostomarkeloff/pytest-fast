@@ -730,8 +730,6 @@ def _collect() -> None:
         error_recorder = _CollectErrorRecorder()
         config.pluginmanager.register(error_recorder)
         config.hook.pytest_collection(session=session)
-        if session.testsfailed and not config.getvalue("continue_on_collection_errors"):
-            raise session.Interrupted(f"{session.testsfailed} error(s) during collection")
         collected_config, collected_items = config, session.items
         collected_errors = error_recorder.errors
         # Reap collect-time cyclic garbage BEFORE freezing. Importing test modules leaves
@@ -1961,25 +1959,46 @@ class Daemon:
                             },
                         )
                         continue
+                    if want_results and self._collect_errors:
+                        frame: dict[str, object] = {
+                            "rc": 2,
+                            "summary": "[pytest-fast] collection errors make compact results incomplete",
+                            "collection_errors": len(self._collect_errors),
+                        }
+                        if stop_on_failure:
+                            frame["stop_on_failure"] = True
+                        if fresh_workers:
+                            frame["fresh_workers"] = True
+                        _try_send(conn, frame)
+                        continue
                     if fresh_workers:
                         if pool is not None:
                             self._teardown_persist_pool(pool)
                             pool = None
                         if stream:
-                            rc, summary = self._run_once(full_report=True, report_conn=conn, selection=selection)
+                            rc, summary = self._run_once(
+                                full_report=True,
+                                report_conn=conn,
+                                selection=selection,
+                                abort_on_collect_errors=want_results,
+                            )
                         else:
                             rc, summary = self._run_once(
                                 progress_conn=conn,
                                 full_report=full_report,
                                 selection=selection,
                                 detailed=detailed,
+                                abort_on_collect_errors=want_results,
                             )
                     elif self.persist_workers and bench == 0:
                         # Warm pool: fork once (lazily), reuse across requests → session fixtures set up
                         # once. Always capture nodeids so any request's selection resolves to indices.
                         if pool is None:
                             pool = self._spawn_persist_pool(send_nodeids=True)
-                        if stream:
+                        if want_results and self._collect_errors:
+                            rc = 2
+                            summary = "[pytest-fast] collection errors make compact results incomplete"
+                        elif stream:
                             rc, summary = self._run_persist_request(
                                 pool,
                                 selection=selection,
@@ -2014,8 +2033,16 @@ class Daemon:
                             full_report=full_report,
                             selection=selection,
                             detailed=detailed,
+                            abort_on_collect_errors=want_results,
                         )
-                    final_frame: dict[str, object] = {"rc": rc, "summary": summary}
+                    if want_results and self._collect_errors:
+                        final_frame = {
+                            "rc": 2,
+                            "summary": "[pytest-fast] collection errors make compact results incomplete",
+                            "collection_errors": len(self._collect_errors),
+                        }
+                    else:
+                        final_frame = {"rc": rc, "summary": summary}
                     if stop_on_failure:
                         final_frame["stop_on_failure"] = True
                     if fresh_workers:
@@ -2056,6 +2083,7 @@ class Daemon:
         report_conn: socket.socket | None,
         selection: list[str] | None,
         profile: bool = False,
+        abort_on_collect_errors: bool = False,
     ) -> _RunOutcome:
         """One fork→serve→collect cycle. Returns raw results + timing + integrity, NO rendering —
         shared by the single-run `_run_once` and the N-run `_run_bench`. `profile` (the bench
@@ -2089,7 +2117,13 @@ class Daemon:
             p.start()
 
         try:
-            results, worker_stats, bus, t_ready, total = self._serve_bus(server, progress_conn, report_conn, selection)
+            results, worker_stats, bus, t_ready, total = self._serve_bus(
+                server,
+                progress_conn,
+                report_conn,
+                selection,
+                abort_on_collect_errors=abort_on_collect_errors,
+            )
         finally:
             # Bounded join: a healthy worker exits within milliseconds of sending `fin`
             # (it calls `os._exit(0)`). If join exceeds the budget, the worker is wedged
@@ -2149,8 +2183,15 @@ class Daemon:
         report_conn: socket.socket | None = None,
         selection: list[str] | None = None,
         detailed: bool = False,
+        abort_on_collect_errors: bool = False,
     ) -> tuple[int, str]:
-        o = self._execute_run(progress_conn, full_report=full_report, report_conn=report_conn, selection=selection)
+        o = self._execute_run(
+            progress_conn,
+            full_report=full_report,
+            report_conn=report_conn,
+            selection=selection,
+            abort_on_collect_errors=abort_on_collect_errors,
+        )
         self._last_outcome = o
         label = "BOOT (collect once)" if o.idx == 0 else f"run #{o.idx} (warm)"
         summary = self._report(
@@ -2236,6 +2277,8 @@ class Daemon:
         progress_conn: socket.socket | None = None,
         report_conn: socket.socket | None = None,
         selection: list[str] | None = None,
+        *,
+        abort_on_collect_errors: bool = False,
     ) -> tuple[list[RunResult], list[WorkerStats], dict[str, float], float, int]:
         # Worker connect with timeout: if a forked worker died BEFORE connect (warmup
         # crash), we don't block in accept() forever — start with whoever made it.
@@ -2337,7 +2380,9 @@ class Daemon:
                             results.append(result)
                             emit_progress()
                             emit_reports(result)
-                        if pick_list is not None:
+                        if abort_on_collect_errors and self._collect_errors:
+                            pick = None
+                        elif pick_list is not None:
                             pick = pick_list[queue_pos] if queue_pos < len(pick_list) else None
                         else:
                             pick = queue_pos if total is not None and queue_pos < total else None
