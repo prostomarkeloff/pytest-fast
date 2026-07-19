@@ -279,6 +279,7 @@ def test_want_results_ships_lean_results_stats_and_meta(seams_daemon: Path, tmp_
 
     meta = cast("dict[str, object]", frame["run_meta"])
     assert meta["total"] == 2
+    assert meta["process_failures"] == []
     assert meta["num_workers"] == 2
     assert meta["start_method"] == "forkserver"
     assert isinstance(meta["run_wall"], float)

@@ -331,6 +331,7 @@ If you need Windows or remote fan-out across machines — use xdist. If you spen
 | `PYTEST_FAST_MARK` | `""` | string | Marker expression, passed as `-m` during collection. |
 | `PYTEST_ADDOPTS` | (inherited) | pytest opts | Standard pytest addopts. In the env fingerprint → a change forces respawn. |
 | `PYTEST_FAST_ENV_PREFIXES` | `""` | comma-separated | Env-var prefixes whose change forces respawn. Mark your app config: `MYAPP_,FEATURE_`. |
+| `PYTEST_FAST_IMMUTABLE_SOURCES` | `""` | boolean | Skip per-request source-tree scans when an outer campaign fingerprints the complete source/config/runtime set before and after the daemon lifetime. Intended for fail-closed tooling, not interactive development. |
 | `PYTEST_FAST_ADDRESS` | (derived) | path | Daemon socket — used by **both** the CLI runner and `pytest --fast`. Prefer this over a bare `--fast-address` path (see the `--fast` caveat above). |
 | `PYTEST_FAST_WORKERS` | (perf cores) | int | Worker count for both front-ends. |
 | `PYTEST_FAST_TTL` | `600` | seconds | Daemon idle TTL for both front-ends. |
@@ -476,6 +477,18 @@ Fired once per test in the worker (hot path — keep it cheap). Exceptions degra
 the daemon log, never a failed test. Per-test **CPU time is already built in**: every lean run ships
 `result["cpu"]` (`duration − cpu ≈ I/O wait`) — no plugin needed.
 
+Worker-owned artifacts that must survive the worker's final `os._exit` can be flushed with the
+shutdown hook:
+
+```python
+def pytest_fast_worker_shutdown(config, workerid):
+    flush_worker_shard(config, workerid)
+```
+
+The hook fires after final fixture teardown and before the worker's successful completion frame. An
+exception is fail-closed: the controller rejects the worker as incomplete instead of accepting a run
+with a missing artifact.
+
 ### Daemon seam — the summary is yours (block design)
 
 The daemon holds every run's aggregated data but (by architecture) no pytest session — collection
@@ -531,6 +544,30 @@ for r in frame.get("results", []):   # keys are optional on daemons predating 0.
 print(frame["summary"])              # the pretty box — post-process/splice as you like
 raise SystemExit(int(frame.get("rc", 1)))
 ```
+
+High-frequency wrapper tools can avoid both stdout rendering and serialized pytest reports with
+`request_run_results`. It delivers validated compact results through a callback while preserving the
+full pytest protocol, ordered selection, stop-first and fresh-worker acknowledgements:
+
+```python
+from pytest_fast import request_run_results
+
+results = []
+frame = request_run_results(
+    "/tmp/my.sock",
+    results.append,
+    nodeids=["tests/test_x.py::test_likely_killer", "tests/test_x.py::test_fallback"],
+    stop_on_failure=True,
+)
+raise SystemExit(int(frame.get("rc", 1)))
+```
+
+Collection errors reject a compact request before any test item is dispatched, so wrapper tools never
+receive results from a shortened suite.
+
+Exact mutation clients can require `EXACT_MUTATION_PROTOCOL_VERSION == 1` before starting a campaign.
+Version 1 covers compact phase results, stop-first/fresh-worker acknowledgements, collection fail-closed
+behavior, and exact active-item evidence for worker process failures.
 
 Protocol compatibility contract: run-request tuples grow positionally (older daemons ignore trailing
 elements), reply frames are dicts (treat unknown keys as optional). A streaming variant with the same

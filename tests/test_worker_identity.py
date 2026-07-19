@@ -34,6 +34,10 @@ def _make_project(root: Path, out: Path) -> None:
             wi = getattr(config, "workerinput", None) or {{}}
             with open(os.path.join(_OUT, f"hook-{{workerid}}.txt"), "w") as fh:
                 fh.write(f"{{workerid}} {{workercount}} {{wi.get('workerid')}}")
+
+        def pytest_fast_worker_shutdown(config, workerid):
+            with open(os.path.join(_OUT, f"shutdown-{{workerid}}.txt"), "w") as fh:
+                fh.write(workerid)
         """)
     )
     (root / "tests" / "test_w.py").write_text(
@@ -51,13 +55,13 @@ def _make_project(root: Path, out: Path) -> None:
     )
 
 
-def _run(project: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(project: Path, *args: str, workers: int = 2) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTEST_FAST_ROOT"] = str(project)
     env.pop("_PYTEST_FAST_COLLECT", None)
     env.pop("PYTEST_FAST_WORKER_IDENTITY", None)  # start from a clean slate regardless of outer run
     return subprocess.run(
-        [sys.executable, "-m", "pytest_fast", "--runs", "1", "--workers", "2", *args],
+        [sys.executable, "-m", "pytest_fast", "--runs", "1", "--workers", str(workers), *args],
         cwd=str(project),
         env=env,
         capture_output=True,
@@ -79,6 +83,7 @@ def test_off_by_default(tmp_path: Path) -> None:
     assert not list(out.glob("hook-*.txt")), "hook fired without --worker-identity"
     observed = {p.read_text() for p in out.glob("env-*.txt")}
     assert observed <= {"None"}, f"PYTEST_XDIST_WORKER set without opt-in: {observed}"
+    assert sorted(p.name for p in out.glob("shutdown-*.txt")) == ["shutdown-gw0.txt", "shutdown-gw1.txt"]
 
 
 def test_on_fires_hook_per_worker_and_sets_env(tmp_path: Path) -> None:
@@ -100,3 +105,17 @@ def test_on_fires_hook_per_worker_and_sets_env(tmp_path: Path) -> None:
 
     observed = {p.read_text() for p in out.glob("env-*.txt")}
     assert any(v.startswith("gw") for v in observed), f"PYTEST_XDIST_WORKER not set in workers: {observed}"
+    assert sorted(p.name for p in out.glob("shutdown-*.txt")) == ["shutdown-gw0.txt", "shutdown-gw1.txt"]
+
+
+def test_on_fires_hook_for_single_worker(tmp_path: Path) -> None:
+    """Worker-owned adapters need the same lifecycle when parallelism is one."""
+    project, out = tmp_path / "proj", tmp_path / "out"
+    project.mkdir()
+    _make_project(project, out)
+
+    proc = _run(project, "--worker-identity", workers=1)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (out / "hook-gw0.txt").read_text() == "gw0 1 gw0"
+    assert {p.read_text() for p in out.glob("env-*.txt")} == {"gw0"}
+    assert (out / "shutdown-gw0.txt").read_text() == "gw0"

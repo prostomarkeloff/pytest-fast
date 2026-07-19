@@ -9,8 +9,13 @@ the *successfully collected* tests still run.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
+
+import pytest
+
+from pytest_fast import _await_ready, _shutdown_daemon, request_run_results
 
 
 def _write_mixed_project(tmp_path: Path) -> None:
@@ -60,3 +65,47 @@ def test_clean_project_has_no_collect_errors_block(tmp_path: Path, pf_cmd: list[
     )
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
     assert "COLLECT ERRORS" not in proc.stdout
+
+
+def test_compact_results_reject_collection_errors_before_execution(
+    tmp_path: Path,
+    tmp_address: str,
+    pf_cmd: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wrapper tooling must not receive partial results from a shortened collection."""
+    _write_mixed_project(tmp_path)
+    marker = tmp_path / "green-test-ran"
+    (tmp_path / "tests" / "test_green.py").write_text(
+        f"from pathlib import Path\ndef test_a() -> None:\n    Path({str(marker)!r}).write_text('ran')\n",
+    )
+    monkeypatch.setenv("PYTEST_FAST_ROOT", str(tmp_path))
+    log_path = Path(tmp_address.removesuffix(".sock") + "-daemon.log")
+    command = [*pf_cmd, "--serve", "--address", tmp_address, "--ttl", "30", "--workers", "2"]
+    with log_path.open("w") as log:
+        proc = subprocess.Popen(
+            command,
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    try:
+        if not _await_ready(tmp_address, proc, timeout=30.0):
+            pytest.fail(f"daemon did not become ready. log:\n{log_path.read_text()}")
+        observed: list[object] = []
+        frame = request_run_results(tmp_address, observed.append)
+        assert frame.get("rc") == 2
+        assert frame.get("collection_errors") == 1
+        assert "collection errors" in str(frame.get("summary"))
+        assert observed == []
+        assert not marker.exists()
+    finally:
+        if proc.poll() is None:
+            _shutdown_daemon(tmp_address)
+            try:
+                proc.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)

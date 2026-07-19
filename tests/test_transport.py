@@ -8,8 +8,24 @@ from __future__ import annotations
 import socket
 import threading
 from pathlib import Path
+from typing import cast
 
-from pytest_fast import _recv, _send, _short_unix_path, request_run, request_run_streamed
+import pytest
+
+from pytest_fast import (
+    EXACT_MUTATION_PROTOCOL_VERSION,
+    RunResult,
+    _recv,
+    _send,
+    _short_unix_path,
+    request_run,
+    request_run_results,
+    request_run_streamed,
+)
+
+
+def test_exact_mutation_protocol_version_is_public() -> None:
+    assert EXACT_MUTATION_PROTOCOL_VERSION == 1
 
 
 def test_roundtrip_basic_types() -> None:
@@ -109,6 +125,104 @@ def _serve_legacy_run_frame(address: Path) -> threading.Thread:
     thread = threading.Thread(target=serve)
     thread.start()
     return thread
+
+
+def _serve_result_frames(
+    address: Path,
+    frames: list[dict[str, object]],
+    requests: list[tuple[object, ...]],
+) -> threading.Thread:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    with _short_unix_path(str(address)) as bind_path:
+        listener.bind(bind_path)
+    listener.listen(1)
+
+    def serve() -> None:
+        with listener:
+            conn, _ = listener.accept()
+            with conn:
+                request, _ = _recv(conn)
+                requests.append(cast("tuple[object, ...]", request))
+                for frame in frames:
+                    _send(conn, frame)
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    return thread
+
+
+def test_results_client_delivers_quiet_progress_and_compact_results(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    address = tmp_path / "results.sock"
+    requests: list[tuple[object, ...]] = []
+    result = {
+        "nodeid": "tests/test_x.py::test_x",
+        "outcome": "failed",
+        "duration": 0.3,
+        "phases": {"setup": 0.1, "call": 0.2, "teardown": 0.0},
+    }
+    thread = _serve_result_frames(
+        address,
+        [
+            {"progress": (1, 1)},
+            {
+                "rc": 1,
+                "summary": "one failed",
+                "results": [result],
+                "stop_on_failure": True,
+            },
+        ],
+        requests,
+    )
+    observed_results: list[RunResult] = []
+    observed_progress: list[tuple[int, int]] = []
+    try:
+        reply = request_run_results(
+            str(address),
+            observed_results.append,
+            on_progress=lambda done, total: observed_progress.append((done, total)),
+            nodeids=["tests/test_x.py::test_x"],
+            stop_on_failure=True,
+        )
+    finally:
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert reply.get("rc") == 1
+    assert observed_progress == [(1, 1)]
+    assert observed_results == [result]
+    assert capsys.readouterr() == ("", "")
+    assert len(requests) == 1
+    request = requests[0]
+    assert request[0] == "run"
+    assert request[2:4] == (False, False)
+    assert request[4] == ["tests/test_x.py::test_x"]
+    assert request[7:10] == (True, True, False)
+
+
+@pytest.mark.parametrize(
+    "final_frame",
+    [
+        {"rc": 0, "summary": "missing results"},
+        {"rc": 0, "summary": "invalid results", "results": ["not a result"]},
+        {"rc": 0, "summary": "invalid result shape", "results": [{}]},
+    ],
+)
+def test_results_client_rejects_missing_or_malformed_results(tmp_path: Path, final_frame: dict[str, object]) -> None:
+    address = tmp_path / "invalid-results.sock"
+    requests: list[tuple[object, ...]] = []
+    thread = _serve_result_frames(address, [final_frame], requests)
+    observed_results: list[RunResult] = []
+    try:
+        reply = request_run_results(str(address), observed_results.append)
+    finally:
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert reply.get("rc") == 2
+    assert "results" in cast("str", reply.get("summary", ""))
+    assert observed_results == []
 
 
 def test_stop_on_failure_rejects_legacy_daemon_without_capability_ack(tmp_path: Path) -> None:
