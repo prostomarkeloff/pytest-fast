@@ -3983,12 +3983,12 @@ def _watch(workers: int, start_method: str, address: str, ttl: float) -> int:
         except OSError:
             _log("watcher", "another watcher already holds the lock — exiting")
             return 0
+        last_warmed = _max_source_mtime()
+        last_attempted = last_warmed
         _log(
             "watcher",
             f"up; pre-warming {address} on source change (poll {_WATCH_POLL}s, debounce {_WATCH_DEBOUNCE}s)",
         )
-        last_warmed = _max_source_mtime()
-        last_attempted = last_warmed
         gone_since: float | None = None
         try:
             while True:
