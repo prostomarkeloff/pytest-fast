@@ -108,6 +108,7 @@ if TYPE_CHECKING:
 # this package's semver promises). Tests/self-test code uses `_*`-names intentionally,
 # but downstream consumers should rely on this list.
 __all__ = [
+    "EXACT_MUTATION_PROTOCOL_VERSION",
     "Daemon",
     "RunResult",
     "SummaryBlock",  # named piece of the summary box (the daemon-plugin render contract)
@@ -122,6 +123,11 @@ __all__ = [
     "resolve_workers",  # public worker-count API (full precedence; stable for external tooling)
     "run_via_daemon",  # client-side ensure/stale-respawn orchestration (stable for external tooling)
 ]
+
+
+# Public capability contract for exact mutation clients. Bump when the compact
+# request/result semantics change incompatibly.
+EXACT_MUTATION_PROTOCOL_VERSION = 1
 
 
 class RunResult(TypedDict):

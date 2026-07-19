@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 
 from pytest_fast import (
+    EXACT_MUTATION_PROTOCOL_VERSION,
     RunResult,
     _recv,
     _send,
@@ -21,6 +22,10 @@ from pytest_fast import (
     request_run_results,
     request_run_streamed,
 )
+
+
+def test_exact_mutation_protocol_version_is_public() -> None:
+    assert EXACT_MUTATION_PROTOCOL_VERSION == 1
 
 
 def test_roundtrip_basic_types() -> None:

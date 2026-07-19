@@ -565,6 +565,10 @@ raise SystemExit(int(frame.get("rc", 1)))
 Collection errors reject a compact request before any test item is dispatched, so wrapper tools never
 receive results from a shortened suite.
 
+Exact mutation clients can require `EXACT_MUTATION_PROTOCOL_VERSION == 1` before starting a campaign.
+Version 1 covers compact phase results, stop-first/fresh-worker acknowledgements, collection fail-closed
+behavior, and exact active-item evidence for worker process failures.
+
 Protocol compatibility contract: run-request tuples grow positionally (older daemons ignore trailing
 elements), reply frames are dicts (treat unknown keys as optional). A streaming variant with the same
 orchestration: `request_run_streamed(addr, on_report=...)` — every per-phase report as it happens.
