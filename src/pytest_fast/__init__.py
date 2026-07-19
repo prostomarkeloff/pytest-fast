@@ -86,6 +86,15 @@ if TYPE_CHECKING:
     from _pytest.nodes import Item
     from _pytest.reports import CollectReport, TestReport
 
+    class _ActiveItemSlots(Protocol):
+        """Shared per-worker item indices used only as crash evidence."""
+
+        def __len__(self) -> int: ...
+
+        def __getitem__(self, index: int) -> int: ...
+
+        def __setitem__(self, index: int, value: int) -> None: ...
+
     class _WorkerConfig(Protocol):
         """The xdist-style worker attributes we graft onto a configured `Config` post-fork.
         pytest's `Config` doesn't declare these (xdist adds them dynamically); casting to this
@@ -175,6 +184,7 @@ class _RunOutcome(NamedTuple):
     short_circuited: bool
     idx: int
     exitcodes: list[int | None]
+    process_failures: list[str]
 
 
 class _PersistPool(NamedTuple):
@@ -188,6 +198,31 @@ class _PersistPool(NamedTuple):
     conns: list[socket.socket]
     total: int
     nodeids: list[str] | None
+    active_items: _ActiveItemSlots
+
+
+_ACTIVE_ITEM_IDLE = -1
+_ACTIVE_ITEM_COMPLETED = -2
+
+
+def _process_failure_nodeids(
+    active_items: _ActiveItemSlots,
+    nodeids: list[str] | None,
+    results: list[RunResult],
+) -> list[str]:
+    """Resolve items whose workers exited while their pytest protocol was active."""
+    if nodeids is None:
+        return []
+    completed = {result["nodeid"] for result in results}
+    failures: list[str] = []
+    for slot in range(len(active_items)):
+        index = active_items[slot]
+        if not isinstance(index, int) or not 0 <= index < len(nodeids):
+            continue
+        nodeid = nodeids[index]
+        if nodeid not in completed and nodeid not in failures:
+            failures.append(nodeid)
+    return failures
 
 
 class ParMetrics(TypedDict):
@@ -1160,6 +1195,7 @@ def _worker_main(
     profile: bool = False,
     num_workers: int = 1,
     testrunuid: str = "",
+    active_items: _ActiveItemSlots | None = None,
 ) -> None:
     # IMPORTANT: read globals via `import pytest_fast`, NOT as bare names. `_collect()`
     # set them on the PRELOADED "pytest_fast" module (forkserver) / at import (spawn),
@@ -1205,10 +1241,13 @@ def _worker_main(
     bus_wait = 0.0  # idle between tests, waiting for the master to hand out the next index
     ran = 0
     prev: Item | None = None
+    prev_idx: int | None = None
     pending: RunResult | None = None
     while True:
         t_bus = time.perf_counter()
         _send(sock, ("req", wid, pending))
+        if pending is not None and active_items is not None:
+            active_items[wid] = _ACTIVE_ITEM_IDLE
         reply, _ = _recv(sock)
         bus_wait += time.perf_counter() - t_bus  # send result + wait for next idx = non-busy gap
         # Master gone / malformed reply → break out and exit cleanly (os._exit below). The
@@ -1219,6 +1258,8 @@ def _worker_main(
         idx = idx_msg[1]
         cur = items[idx] if isinstance(idx, int) and 0 <= idx < len(items) else None
         if prev is not None:
+            if active_items is not None and prev_idx is not None:
+                active_items[wid] = prev_idx
             t0 = time.perf_counter()
             c0 = time.process_time()
             if faulthandler_mod is not None:
@@ -1244,6 +1285,8 @@ def _worker_main(
             cpu_this = time.process_time() - c0
             cpu += cpu_this
             pending["cpu"] = cpu_this  # per-test CPU → `bench` I/O-vs-CPU classification
+            if active_items is not None:
+                active_items[wid] = _ACTIVE_ITEM_COMPLETED
             ran += 1
         else:
             pending = None
@@ -1258,8 +1301,11 @@ def _worker_main(
                 "run_wall": time.perf_counter() - run_start,
             }
             _send(sock, ("fin", wid, pending, stats))
+            if pending is not None and active_items is not None:
+                active_items[wid] = _ACTIVE_ITEM_IDLE
             break
         prev = cur
+        prev_idx = idx if isinstance(idx, int) else None
     sock.close()
     # Worker exit: `os._exit(0)` — skip atexit hooks AND non-daemon thread joins.
     # Returning normally would let interpreter shutdown join() every alive non-daemon
@@ -1280,6 +1326,7 @@ def _worker_persist_main(
     send_nodeids: bool = False,
     num_workers: int = 1,
     testrunuid: str = "",
+    active_items: _ActiveItemSlots | None = None,
 ) -> None:
     """Persist-mode worker (opt-in `--persist-workers`, serve mode): forked ONCE, its pytest session
     spans MANY run requests. Between runs the session — and its session-scoped fixtures — stays alive:
@@ -1329,7 +1376,10 @@ def _worker_persist_main(
 
     stop = False
     while not stop:  # spans runs — session persists across this outer loop
+        if active_items is not None:
+            active_items[wid] = _ACTIVE_ITEM_IDLE
         prev: Item | None = None
+        prev_idx: int | None = None
         pending: RunResult | None = None
         ran = 0
         busy = 0.0
@@ -1337,6 +1387,8 @@ def _worker_persist_main(
         run_start = time.perf_counter()
         while True:  # one run
             _send(sock, ("req", wid, pending))
+            if pending is not None and active_items is not None:
+                active_items[wid] = _ACTIVE_ITEM_IDLE
             reply, _ = _recv(sock)
             if not isinstance(reply, tuple) or not reply:
                 stop = True  # master gone → shut this worker down (final teardown below)
@@ -1348,11 +1400,17 @@ def _worker_persist_main(
             if tag == "flush":
                 full_report = len(reply) > 1 and bool(reply[1])
                 if prev is not None:
+                    if active_items is not None and prev_idx is not None:
+                        active_items[wid] = prev_idx
                     t0 = time.perf_counter()
                     pending = _run_one_item(prev, session_boundary, collector, full_report=full_report)
                     busy += time.perf_counter() - t0
+                    if active_items is not None:
+                        active_items[wid] = _ACTIVE_ITEM_COMPLETED
                     ran += 1
                     _send(sock, ("req", wid, pending))  # ship the run's last result
+                    if active_items is not None:
+                        active_items[wid] = _ACTIVE_ITEM_IDLE
                 elif eager_run and session_boundary is not None:
                     # A short-circuit may leave setup-state pointing at the undispatched lookahead
                     # item used as pytest's nextitem. Retain only session-scoped fixtures across requests.
@@ -1381,21 +1439,30 @@ def _worker_persist_main(
                 nxt = next_selected if next_selected is not cur else None
                 if nxt is None:
                     nxt = session_boundary
+                if active_items is not None:
+                    active_items[wid] = idx
                 t0 = time.perf_counter()
                 pending = _run_one_item(cur, nxt, collector, full_report=full_report)
                 busy += time.perf_counter() - t0
+                if active_items is not None:
+                    active_items[wid] = _ACTIVE_ITEM_COMPLETED
                 ran += 1
                 eager_run = True
                 prev = None
                 continue
             if prev is not None:
+                if active_items is not None and prev_idx is not None:
+                    active_items[wid] = prev_idx
                 t0 = time.perf_counter()
                 pending = _run_one_item(prev, cur, collector, full_report=full_report)
                 busy += time.perf_counter() - t0
+                if active_items is not None:
+                    active_items[wid] = _ACTIVE_ITEM_COMPLETED
                 ran += 1
             else:
                 pending = None
             prev = cur
+            prev_idx = idx if isinstance(idx, int) else None
     # Daemon shutdown: finalize the long-lived session (its session-scoped fixtures persisted across all
     # runs via the anchor). At a run boundary `prev` is already run+shipped, so there's no item to tear
     # down against None — drain the session's setup-state directly (parity with the per-run path, whose
@@ -1552,11 +1619,20 @@ class Daemon:
         server.bind(sock_path)
         server.listen(self.num_workers)
         testrunuid = uuid.uuid4().hex
+        active_items = cast(
+            "_ActiveItemSlots",
+            self.ctx.RawArray("q", [_ACTIVE_ITEM_IDLE] * self.num_workers),
+        )
         procs: list[BaseProcess] = [
             self.ctx.Process(
                 target=_worker_persist_main,
                 args=(wid, sock_path),
-                kwargs={"send_nodeids": send_nodeids, "num_workers": self.num_workers, "testrunuid": testrunuid},
+                kwargs={
+                    "send_nodeids": send_nodeids,
+                    "num_workers": self.num_workers,
+                    "testrunuid": testrunuid,
+                    "active_items": active_items,
+                },
                 daemon=True,
             )
             for wid in range(self.num_workers)
@@ -1579,7 +1655,15 @@ class Daemon:
                 if len(msg) > 5 and isinstance(msg[5], list):
                     self._collect_errors = cast("list[tuple[str, str]]", msg[5])
         server.settimeout(None)
-        return _PersistPool(server=server, sock_path=sock_path, procs=procs, conns=conns, total=total, nodeids=nodeids)
+        return _PersistPool(
+            server=server,
+            sock_path=sock_path,
+            procs=procs,
+            conns=conns,
+            total=total,
+            nodeids=nodeids,
+            active_items=active_items,
+        )
 
     def _dispatch_persist(
         self,
@@ -1595,6 +1679,8 @@ class Daemon:
         the queue drains, stream reports, collect results + per-run stats. Workers stay alive after
         'run_done' (session warm). The one-item lag means a worker's last result arrives post-'flush'."""
         t0 = time.perf_counter()
+        for wid in range(len(pool.active_items)):
+            pool.active_items[wid] = _ACTIVE_ITEM_IDLE
         pick_list: list[int] | None = None
         if selection is not None and pool.nodeids is not None:
             idx_of = {nid: i for i, nid in enumerate(pool.nodeids)}
@@ -1694,6 +1780,7 @@ class Daemon:
             short_circuited=short_circuited,
             idx=1,
             exitcodes=exitcodes,
+            process_failures=_process_failure_nodeids(pool.active_items, pool.nodeids, results),
         )
 
     def _run_persist_request(
@@ -2055,6 +2142,7 @@ class Daemon:
                             "total": o.total,
                             "planned_total": o.planned_total,
                             "short_circuited": o.short_circuited,
+                            "process_failures": o.process_failures,
                             "warmup": o.warmup,
                             "run_wall": o.run_wall,
                             "num_workers": self.num_workers,
@@ -2104,10 +2192,14 @@ class Daemon:
         # One run id shared by every worker in this run (xdist's PYTEST_XDIST_TESTRUNUID semantics);
         # per-worker isolation comes from the distinct workerid, not this.
         testrunuid = uuid.uuid4().hex
+        active_items = cast(
+            "_ActiveItemSlots",
+            self.ctx.RawArray("q", [_ACTIVE_ITEM_IDLE] * self.num_workers),
+        )
         procs = [
             self.ctx.Process(
                 target=_worker_main,
-                args=(wid, sock_path, full_report, send_nodeids, profile, self.num_workers, testrunuid),
+                args=(wid, sock_path, full_report, send_nodeids, profile, self.num_workers, testrunuid, active_items),
                 daemon=True,
             )
             for wid in range(self.num_workers)
@@ -2117,11 +2209,12 @@ class Daemon:
             p.start()
 
         try:
-            results, worker_stats, bus, t_ready, total = self._serve_bus(
+            results, worker_stats, bus, t_ready, total, process_failures = self._serve_bus(
                 server,
                 progress_conn,
                 report_conn,
                 selection,
+                active_items,
                 abort_on_collect_errors=abort_on_collect_errors,
             )
         finally:
@@ -2160,6 +2253,7 @@ class Daemon:
             short_circuited=False,
             idx=idx,
             exitcodes=[p.exitcode for p in procs],
+            process_failures=process_failures,
         )
 
     @staticmethod
@@ -2277,9 +2371,10 @@ class Daemon:
         progress_conn: socket.socket | None = None,
         report_conn: socket.socket | None = None,
         selection: list[str] | None = None,
+        active_items: _ActiveItemSlots | None = None,
         *,
         abort_on_collect_errors: bool = False,
-    ) -> tuple[list[RunResult], list[WorkerStats], dict[str, float], float, int]:
+    ) -> tuple[list[RunResult], list[WorkerStats], dict[str, float], float, int, list[str]]:
         # Worker connect with timeout: if a forked worker died BEFORE connect (warmup
         # crash), we don't block in accept() forever — start with whoever made it.
         sel = selectors.DefaultSelector()
@@ -2303,6 +2398,7 @@ class Daemon:
             # nodeids), pick_list holds the daemon-side item indices to actually run, built from
             # the first worker 'ready' that carries the nodeid list. None → run the full suite.
             pick_list: list[int] | None = None
+            collected_nodeids: list[str] | None = None
             selection_known_total: int | None = None
             queue_pos = 0
             results: list[RunResult] = []
@@ -2360,6 +2456,8 @@ class Daemon:
                     kind = parts[0]
                     if kind == "ready":
                         total = cast("int", parts[2])
+                        if len(parts) > 4 and isinstance(parts[4], list):
+                            collected_nodeids = cast("list[str]", parts[4])
                         if len(parts) > 5 and isinstance(parts[5], list):
                             self._collect_errors = cast("list[tuple[str, str]]", parts[5])
                         # Selection mode: resolve the controller's nodeids → daemon item indices
@@ -2412,7 +2510,10 @@ class Daemon:
             emit_progress(force=True)  # final frame (done==target) — guaranteed
             bus = {"tx": float(tx), "rx": float(rx), "req_count": float(req_count)}
             run_total = selection_known_total if selection_known_total is not None else (total or 0)
-            return results, worker_stats, bus, t_ready, run_total
+            process_failures = (
+                _process_failure_nodeids(active_items, collected_nodeids, results) if active_items is not None else []
+            )
+            return results, worker_stats, bus, t_ready, run_total, process_failures
         finally:
             sel.close()
 
@@ -2617,8 +2718,9 @@ def request_run(
     `want_results` (wrapper clients) asks the daemon to also put the run's per-test data into
     the final frame: `results` (lean `RunResult`s — nodeid/outcome/duration/cpu/extra/longrepr,
     never the heavy per-phase `reports`), `worker_stats` (list[WorkerStats]) and `run_meta`
-    ({total, warmup, run_wall, num_workers, start_method}). ~100 bytes/test on the wire. A daemon
-    predating the flag returns the plain `{rc, summary}` frame — treat the keys as optional.
+    ({total, process_failures, warmup, run_wall, num_workers, start_method}). `process_failures`
+    lists only nodeids whose worker exited while that item's pytest protocol was active. ~100 bytes/test
+    on the wire. A daemon predating the flag returns the plain `{rc, summary}` frame — treat the keys as optional.
 
     `nodeids` restricts the request to an ordered selection. `stop_on_failure` asks a persistent
     worker pool to stop dispatching that selection after the first observed failed/error result.

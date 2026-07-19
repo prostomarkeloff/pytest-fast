@@ -356,6 +356,64 @@ def _make_stop_first_project(root: Path, sentinel: Path) -> None:
     )
 
 
+def _make_process_exit_project(root: Path) -> None:
+    """Project with a worker-level exit between two ordinary green items."""
+    (root / "tests").mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "process-exit"\nversion = "0"\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'
+    )
+    (root / "tests" / "test_exit.py").write_text(
+        textwrap.dedent("""
+        import os
+
+        def test_green_before():
+            assert True
+
+        def test_process_exit():
+            os._exit(17)
+
+        def test_green_after():
+            assert True
+        """)
+    )
+
+
+@pytest.mark.parametrize("fresh_workers", [False, True])
+def test_compact_run_reports_exact_active_item_on_worker_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_workers: bool,
+) -> None:
+    """An untrusted result undercount identifies only the item active inside pytest protocol."""
+    project = tmp_path / "proj"
+    _make_process_exit_project(project)
+    address = str(tmp_path / "pf.sock")
+    monkeypatch.setenv("PYTEST_FAST_ROOT", str(project))
+    proc = _spawn_daemon(project, address, "--persist-workers")
+    selected = [
+        "tests/test_exit.py::test_green_before",
+        "tests/test_exit.py::test_process_exit",
+        "tests/test_exit.py::test_green_after",
+    ]
+    results: list[RunResult] = []
+    try:
+        assert _await_ready(address, proc, timeout=30.0), "daemon did not become ready"
+        reply = request_run_results(
+            address,
+            results.append,
+            nodeids=selected,
+            stop_on_failure=not fresh_workers,
+            fresh_workers=fresh_workers,
+        )
+        assert reply.get("rc") == 1, reply
+        assert [result["nodeid"] for result in results] == [selected[0]]
+        meta = cast("dict[str, object]", reply["run_meta"])
+        assert meta["process_failures"] == [selected[1]]
+        assert "UNTRUSTED" in cast("str", reply["summary"])
+    finally:
+        _stop(proc, address)
+
+
 def test_persist_stop_on_failure_stops_dispatch_and_reports_trusted_short_circuit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
