@@ -102,6 +102,21 @@ def test_stale_reason_sources_changed(
     assert _stale_reason(boot_mtime, boot_fp, boot_fp) == "sources changed"
 
 
+def test_stale_reason_can_skip_source_scan_but_keeps_env_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_project: Path,
+) -> None:
+    """Immutable-source campaigns avoid the O(tree) hot-path scan, not env validation."""
+    monkeypatch.setenv("PYTEST_FAST_ROOT", str(tmp_project))
+    boot_mtime = _max_source_mtime()
+    boot_fp = _env_fingerprint()
+    future = boot_mtime + 10.0
+    os.utime(tmp_project / "src" / "foo.py", (future, future))
+
+    assert _stale_reason(boot_mtime, boot_fp, boot_fp, check_sources=False) is None
+    assert _stale_reason(boot_mtime, boot_fp, "changed", check_sources=False) == "env changed"
+
+
 def test_stale_reason_env_changed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_project: Path,

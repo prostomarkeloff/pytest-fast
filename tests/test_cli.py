@@ -66,6 +66,32 @@ def test_local_run_all_green_when_no_failures(tmp_path: Path, pf_cmd: list[str])
     assert "FAILURES" not in proc.stdout
 
 
+def test_local_run_fails_closed_on_collection_error(tmp_path: Path, pf_cmd: list[str]) -> None:
+    """A partially collected suite is never executed or reported as trusted."""
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    ran_marker = tmp_path / "valid-test-ran"
+    (tests_dir / "test_valid.py").write_text(
+        f"from pathlib import Path\ndef test_valid() -> None:\n    Path({str(ran_marker)!r}).write_text('ran')\n",
+    )
+    (tests_dir / "test_broken.py").write_text("import module_that_does_not_exist\n")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "tmp"\nversion = "0"\n')
+
+    proc = subprocess.run(
+        [*pf_cmd, "--workers", "2", "--runs", "1"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+
+    output = f"{proc.stdout}\n{proc.stderr}"
+    assert proc.returncode != 0, output
+    assert not ran_marker.exists(), output
+    assert "collection" in output.lower(), output
+
+
 def test_detailed_flag_toggles_parallelism_block(tmp_path: Path, pf_cmd: list[str]) -> None:
     """`--detailed` adds the extended parallelism block (eff / CPU vs I/O / lost / floor); a plain
     run stays lean. Drives the real CLI → daemon-rendered summary path end to end."""

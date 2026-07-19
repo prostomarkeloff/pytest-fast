@@ -21,7 +21,14 @@ from typing import cast
 
 import pytest
 
-from pytest_fast import _await_ready, _shutdown_daemon, request_run, request_run_streamed
+from pytest_fast import (
+    RunResult,
+    _await_ready,
+    _shutdown_daemon,
+    request_run,
+    request_run_results,
+    request_run_streamed,
+)
 
 
 def _make_project(root: Path, counter: Path) -> None:
@@ -169,6 +176,54 @@ def test_persist_serve_amortizes_across_run_requests(tmp_path: Path, monkeypatch
         _stop(proc, address)
 
 
+def test_persist_lean_results_skip_report_serialization_and_keep_phase_timings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lean persistent request keeps exact phase timings but does not build native wire reports."""
+    project, counter = tmp_path / "proj", tmp_path / "setups.txt"
+    serialized = tmp_path / "serialized-reports.txt"
+    project.mkdir()
+    _make_project(project, counter)
+    conftest = project / "conftest.py"
+    conftest.write_text(
+        conftest.read_text()
+        + textwrap.dedent(f"""
+
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_report_to_serializable(config, report):
+            with open({str(serialized)!r}, "a") as stream:
+                stream.write(f"{{report.nodeid}}:{{report.when}}\\n")
+            return None
+        """)
+    )
+    address = str(tmp_path / "pf.sock")
+    monkeypatch.setenv("PYTEST_FAST_ROOT", str(project))
+    proc = _spawn_daemon(project, address, "--persist-workers")
+    selected = ["tests/test_uses_resource.py::test_a"]
+    try:
+        assert _await_ready(address, proc, timeout=30.0), "daemon did not become ready"
+        lean = request_run(address, nodeids=selected, want_results=True)
+        assert lean.get("rc") == 0, lean
+        results = cast("list[dict[str, object]]", lean.get("results"))
+        assert len(results) == 1
+        phases = cast("dict[str, float]", results[0]["phases"])
+        assert set(phases) == {"setup", "call", "teardown"}
+        assert all(duration >= 0 for duration in phases.values())
+        assert not serialized.exists(), "lean request must not invoke pytest_report_to_serializable"
+
+        reports: list[dict[str, object]] = []
+        native = request_run_streamed(address, reports.append, nodeids=selected)
+        assert native.get("rc") == 0, native
+        assert reports
+        assert serialized.read_text().splitlines() == [
+            f"{selected[0]}:setup",
+            f"{selected[0]}:call",
+            f"{selected[0]}:teardown",
+        ]
+    finally:
+        _stop(proc, address)
+
+
 def test_fresh_workers_reuses_collection_but_restarts_the_pytest_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -180,17 +235,19 @@ def test_fresh_workers_reuses_collection_but_restarts_the_pytest_session(
     monkeypatch.setenv("PYTEST_FAST_ROOT", str(project))
     proc = _spawn_daemon(project, address, "--persist-workers")
     selected = ["tests/test_uses_resource.py::test_a"]
+    fresh_results: list[RunResult] = []
     try:
         assert _await_ready(address, proc, timeout=30.0), "daemon did not become ready"
         warm = request_run(address, nodeids=selected)
         transition = request_run(address, nodeids=[], fresh_workers=True)
-        fresh_a = request_run(address, nodeids=selected, fresh_workers=True)
+        fresh_a = request_run_results(address, fresh_results.append, nodeids=selected, fresh_workers=True)
         fresh_b = request_run(address, nodeids=selected, fresh_workers=True)
         warm_again = request_run(address, nodeids=selected)
 
         assert [reply.get("rc") for reply in (warm, transition, fresh_a, fresh_b, warm_again)] == [0] * 5
         assert transition.get("fresh_workers") is True
         assert fresh_a.get("fresh_workers") is True
+        assert [result["nodeid"] for result in fresh_results] == selected
         assert fresh_b.get("fresh_workers") is True
         assert counter.read_text().splitlines() == ["setup", "setup", "setup", "setup"]
     finally:
@@ -438,6 +495,36 @@ def test_persist_streamed_stop_on_failure_uses_the_same_dispatch_contract(
         assert reply.get("rc") == 1, reply
         assert not sentinel.exists()
         assert {report["nodeid"] for report in reports} == {"tests/test_stop.py::test_fail"}
+    finally:
+        _stop(proc, address)
+
+
+def test_persist_compact_results_stop_on_failure_uses_the_same_dispatch_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compact wrapper client stops at the same item and returns its exact lean result."""
+    project, sentinel = tmp_path / "proj", tmp_path / "must-not-run"
+    _make_stop_first_project(project, sentinel)
+    address = str(tmp_path / "pf.sock")
+    monkeypatch.setenv("PYTEST_FAST_ROOT", str(project))
+    proc = _spawn_daemon(project, address, "--persist-workers")
+    results: list[RunResult] = []
+    progress: list[tuple[int, int]] = []
+    try:
+        assert _await_ready(address, proc, timeout=30.0), "daemon did not become ready"
+        reply = request_run_results(
+            address,
+            results.append,
+            on_progress=lambda done, total: progress.append((done, total)),
+            nodeids=["tests/test_stop.py::test_fail", "tests/test_stop.py::test_must_not_run"],
+            stop_on_failure=True,
+        )
+        assert reply.get("rc") == 1, reply
+        assert reply.get("stop_on_failure") is True
+        assert not sentinel.exists()
+        assert [result["nodeid"] for result in results] == ["tests/test_stop.py::test_fail"]
+        assert [result["outcome"] for result in results] == ["failed"]
+        assert progress == [(1, 2)]
     finally:
         _stop(proc, address)
 

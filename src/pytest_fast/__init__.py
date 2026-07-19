@@ -108,6 +108,7 @@ __all__ = [
     "main",
     "main_cli",
     "request_run",  # client-side, module-level
+    "request_run_results",  # quiet compact-result client for wrapper tools
     "request_run_streamed",  # client-side streaming (used by the --fast plugin controller)
     "resolve_workers",  # public worker-count API (full precedence; stable for external tooling)
     "run_via_daemon",  # client-side ensure/stale-respawn orchestration (stable for external tooling)
@@ -120,6 +121,9 @@ class RunResult(TypedDict):
     nodeid: str
     outcome: str
     duration: float
+    # Maximum duration of each pytest phase. Compact clients get this without serializing TestReport;
+    # a phase can be absent when setup/call short-circuits.
+    phases: NotRequired[dict[str, float]]
     # Per-test process CPU time (duration − cpu ≈ I/O wait). Stamped by the standard worker loop
     # on EVERY run (lean included) — consumers (`bench` I/O-vs-CPU, timing gates via
     # `want_results`) may rely on it there; absent in `--persist-workers` mode.
@@ -726,6 +730,8 @@ def _collect() -> None:
         error_recorder = _CollectErrorRecorder()
         config.pluginmanager.register(error_recorder)
         config.hook.pytest_collection(session=session)
+        if session.testsfailed and not config.getvalue("continue_on_collection_errors"):
+            raise session.Interrupted(f"{session.testsfailed} error(s) during collection")
         collected_config, collected_items = config, session.items
         collected_errors = error_recorder.errors
         # Reap collect-time cyclic garbage BEFORE freezing. Importing test modules leaves
@@ -1031,6 +1037,11 @@ def _run_one_item(
     duration = sum(r.duration for r in collector.reports)
     outcome = categorize(item.config, collector.reports)
     result: RunResult = {"nodeid": item.nodeid, "outcome": outcome, "duration": duration}
+    phases: dict[str, float] = {}
+    for report in collector.reports:
+        if report.when in {"setup", "call", "teardown"}:
+            phases[report.when] = max(phases.get(report.when, 0.0), report.duration)
+    result["phases"] = phases
     if pr is not None:
         result["profile"] = _top_profile_rows(pr)
     if outcome in {"failed", "error"}:
@@ -1103,7 +1114,7 @@ def _setup_worker_identity(config: Config, wid: int, num_workers: int, testrunui
     state and the hook is pytest-fast's own. Opt-in (see `_worker_identity_enabled`), fully
     best-effort and guarded — any failure leaves the worker as it was (shared identity), never worse.
     """
-    if not _worker_identity_enabled() or num_workers <= 1 or hasattr(config, "workerinput"):
+    if not _worker_identity_enabled() or hasattr(config, "workerinput"):
         return
 
     workerid = f"gw{wid}"
@@ -1131,6 +1142,16 @@ def _setup_worker_identity(config: Config, wid: int, num_workers: int, testrunui
         config.hook.pytest_fast_configure_worker(config=config, workerid=workerid, workercount=num_workers)
     except Exception as exc:
         _log("worker", f"{workerid}: pytest_fast_configure_worker hook failed: {exc!r}")
+
+
+def _shutdown_worker_plugins(config: Config, wid: int) -> None:
+    """Finalize worker-owned plugin state before the successful ``fin`` frame.
+
+    The hook runs before ``os._exit`` so plugins can durably flush process-local data. An exception is
+    deliberately fail-closed: the worker does not send ``fin``, and the controller rejects the run as
+    incomplete instead of accepting missing plugin output.
+    """
+    config.hook.pytest_fast_worker_shutdown(config=config, workerid=f"gw{wid}")
 
 
 def _worker_main(
@@ -1229,6 +1250,7 @@ def _worker_main(
         else:
             pending = None
         if cur is None:
+            _shutdown_worker_plugins(config, wid)
             stats: WorkerStats = {
                 "wid": wid,
                 "ran": ran,
@@ -1326,9 +1348,10 @@ def _worker_persist_main(
                 stop = True
                 break
             if tag == "flush":
+                full_report = len(reply) > 1 and bool(reply[1])
                 if prev is not None:
                     t0 = time.perf_counter()
-                    pending = _run_one_item(prev, session_boundary, collector, full_report=True)
+                    pending = _run_one_item(prev, session_boundary, collector, full_report=full_report)
                     busy += time.perf_counter() - t0
                     ran += 1
                     _send(sock, ("req", wid, pending))  # ship the run's last result
@@ -1349,6 +1372,7 @@ def _worker_persist_main(
             idx = reply[1]  # ('idx', pick)
             cur = items[idx] if isinstance(idx, int) and 0 <= idx < len(items) else None
             eager = len(reply) > 2 and bool(reply[2])
+            full_report = len(reply) > 4 and bool(reply[4])
             if eager and cur is not None:
                 # Stop-first requests cannot use the normal one-item lag: by the time the master
                 # sees item N fail, item N+1 would already be held and `flush` would execute it.
@@ -1360,7 +1384,7 @@ def _worker_persist_main(
                 if nxt is None:
                     nxt = session_boundary
                 t0 = time.perf_counter()
-                pending = _run_one_item(cur, nxt, collector, full_report=True)
+                pending = _run_one_item(cur, nxt, collector, full_report=full_report)
                 busy += time.perf_counter() - t0
                 ran += 1
                 eager_run = True
@@ -1368,7 +1392,7 @@ def _worker_persist_main(
                 continue
             if prev is not None:
                 t0 = time.perf_counter()
-                pending = _run_one_item(prev, cur, collector, full_report=True)
+                pending = _run_one_item(prev, cur, collector, full_report=full_report)
                 busy += time.perf_counter() - t0
                 ran += 1
             else:
@@ -1385,6 +1409,7 @@ def _worker_persist_main(
     elif anchor is not None:
         with suppress(Exception):
             anchor.session._setupstate.teardown_exact(None)  # finalize session-scoped fixtures
+    _shutdown_worker_plugins(config, wid)
     with suppress(OSError):
         _send(sock, ("bye", wid))
     sock.close()
@@ -1565,6 +1590,7 @@ class Daemon:
         selection: list[str] | None,
         progress_conn: socket.socket | None,
         report_conn: socket.socket | None,
+        full_report: bool,
         stop_on_failure: bool,
     ) -> _RunOutcome:
         """One run over the WARM pool: hand each worker item indices (work-stealing), send 'flush' when
@@ -1648,9 +1674,9 @@ class Daemon:
                         next_pick = reserve_next() if stop_on_failure else None
                         if next_pick is not None:
                             reserved[conn] = next_pick
-                        tx += _send(conn, ("idx", pick, stop_on_failure, next_pick))
+                        tx += _send(conn, ("idx", pick, stop_on_failure, next_pick, full_report))
                     else:
-                        tx += _send(conn, ("flush",))
+                        tx += _send(conn, ("flush", full_report))
                         flushed.add(conn)
         finally:
             sel.close()
@@ -1697,6 +1723,7 @@ class Daemon:
             selection=selection,
             progress_conn=progress_conn,
             report_conn=report_conn,
+            full_report=full_report,
             stop_on_failure=stop_on_failure,
         )
         self._last_outcome = o
@@ -1757,6 +1784,7 @@ class Daemon:
         """
         boot_mtime = _max_source_mtime()  # baseline BEFORE boot: an edit mid-build → stale
         boot_fp = _env_fingerprint()  # env snapshot at boot: change to relevant env → stale-respawn
+        check_sources = not _immutable_sources_enabled()
         _log("daemon", f"booting — collect once ({self.start_method}, {self.num_workers}w)…")
         t0 = time.perf_counter()
         self._arm_collect_flag()  # arm the env flag right before the first Process.start()
@@ -1804,7 +1832,17 @@ class Daemon:
                         # _try_send (not _send): a status client that already hit its own recv
                         # timeout and disconnected must not crash us with a BrokenPipe on reply.
                         _try_send(
-                            conn, {"ready": True, "stale": _stale_reason(boot_mtime, boot_fp, client_fp) is not None}
+                            conn,
+                            {
+                                "ready": True,
+                                "stale": _stale_reason(
+                                    boot_mtime,
+                                    boot_fp,
+                                    client_fp,
+                                    check_sources=check_sources,
+                                )
+                                is not None,
+                            },
                         )
                         continue
                     if cmd == "shutdown":
@@ -1843,7 +1881,12 @@ class Daemon:
                         # down (a same-user DoS). Real clients always send the verb "run".
                         continue
                     # run request: ('run', fp[, full_report[, stream[, nodeids[, detailed]]]])
-                    reason = _stale_reason(boot_mtime, boot_fp, client_fp)
+                    reason = _stale_reason(
+                        boot_mtime,
+                        boot_fp,
+                        client_fp,
+                        check_sources=check_sources,
+                    )
                     if reason is not None:
                         _log("daemon", f"{reason} — exiting stale")
                         _try_send(conn, {"stale": True})  # best-effort; exit stale regardless
@@ -2598,6 +2641,102 @@ def request_run(
             return _validate_fresh_workers_ack(frame, requested=fresh_workers)
 
 
+def _valid_run_result(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    nodeid = value.get("nodeid")
+    outcome = value.get("outcome")
+    duration = value.get("duration")
+    if not (
+        isinstance(nodeid, str)
+        and outcome in _OUTCOME_PRIORITY
+        and isinstance(duration, int | float)
+        and not isinstance(duration, bool)
+        and math.isfinite(duration)
+        and duration >= 0
+    ):
+        return False
+    phases = value.get("phases")
+    if phases is None:
+        return True
+    return isinstance(phases, dict) and all(
+        phase in {"setup", "call", "teardown"}
+        and isinstance(seconds, int | float)
+        and not isinstance(seconds, bool)
+        and math.isfinite(seconds)
+        and seconds >= 0
+        for phase, seconds in phases.items()
+    )
+
+
+def request_run_results(
+    address: str,
+    on_result: Callable[[RunResult], None],
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+    nodeids: list[str] | None = None,
+    stop_on_failure: bool = False,
+    fresh_workers: bool = False,
+) -> dict[str, object]:
+    """Run a selection through the compact protocol and deliver validated lean results.
+
+    Unlike :func:`request_run`, this wrapper never writes progress to stdout. Unlike
+    :func:`request_run_streamed`, it does not ask workers to serialize full pytest reports. The daemon
+    still runs the complete pytest protocol and returns one ``RunResult`` per executed item.
+    """
+    if fresh_workers and stop_on_failure:
+        return {
+            "rc": 2,
+            "summary": "[pytest-fast] fresh_workers cannot be combined with stop_on_failure",
+        }
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    with _short_unix_path(address) as connect_path:
+        sock.connect(connect_path)
+    with sock:
+        _send(
+            sock,
+            (
+                "run",
+                _env_fingerprint(),
+                False,
+                False,
+                nodeids,
+                False,
+                0,
+                True,
+                stop_on_failure,
+                fresh_workers,
+            ),
+        )
+        while True:
+            raw, _ = _recv(sock)
+            if not isinstance(raw, dict):
+                return {"rc": 1, "summary": "[pytest-fast] daemon closed connection mid-run"}
+            frame = cast("dict[str, object]", raw)
+            progress = frame.get("progress")
+            if progress is not None:
+                if not (
+                    isinstance(progress, tuple)
+                    and len(progress) == 2
+                    and all(isinstance(value, int) and not isinstance(value, bool) for value in progress)
+                ):
+                    return {"rc": 2, "summary": "[pytest-fast] daemon returned malformed progress"}
+                if on_progress is not None:
+                    on_progress(progress[0], progress[1])
+                continue
+
+            frame = _validate_stop_on_failure_ack(frame, requested=stop_on_failure)
+            frame = _validate_fresh_workers_ack(frame, requested=fresh_workers)
+            if frame.get("stale") is True or frame.get("rc") not in {0, 1}:
+                return frame
+            results = frame.get("results")
+            if not isinstance(results, list) or any(not _valid_run_result(result) for result in results):
+                return {"rc": 2, "summary": "[pytest-fast] daemon returned missing or malformed results"}
+            for result in results:
+                on_result(cast("RunResult", result))
+            return frame
+
+
 def request_run_streamed(
     address: str,
     on_report: Callable[[dict[str, object]], None],
@@ -2889,6 +3028,7 @@ _FINGERPRINT_KEYS = (
     "PYTEST_FAST_ENV_PREFIXES",  # change in the prefix list itself must respawn too
     "PYTEST_FAST_WORKER_IDENTITY",  # opt-in per-worker xdist identity changes worker setup → respawn
     "PYTEST_FAST_DAEMON_PLUGINS",  # daemon-side plugin list is baked at first use → respawn on change
+    "PYTEST_FAST_IMMUTABLE_SOURCES",  # opt-in: caller proves the source tree is immutable during the daemon run
 )
 
 
@@ -2914,14 +3054,26 @@ def _env_fingerprint() -> str:
     return hashlib.sha1(blob.encode("utf-8", "surrogateescape")).hexdigest()
 
 
-def _stale_reason(boot_mtime: float, boot_fp: str, client_fp: str | None) -> str | None:
+def _immutable_sources_enabled() -> bool:
+    """Whether the caller guarantees that source files stay unchanged for this daemon lifetime."""
+    return os.environ.get("PYTEST_FAST_IMMUTABLE_SOURCES", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _stale_reason(
+    boot_mtime: float,
+    boot_fp: str,
+    client_fp: str | None,
+    *,
+    check_sources: bool = True,
+) -> str | None:
     """Why a warm daemon must be discarded, or None if still fresh. Source edits beat
     env changes in the message only; either alone forces a respawn. `client_fp` is
     None for legacy callers that don't send a fingerprint → env check is skipped.
 
     Uses `_any_source_newer` (early-exit), NOT `_max_source_mtime` — on large repos
-    that's O(1) instead of O(N) once the first newer file is found."""
-    if _any_source_newer(boot_mtime):
+    that's O(1) instead of O(N) once the first newer file is found. Immutable campaigns can disable
+    this scan when an outer start/end fingerprint proves the stronger whole-run invariant."""
+    if check_sources and _any_source_newer(boot_mtime):
         return "sources changed"
     if client_fp is not None and client_fp != boot_fp:
         return "env changed"
@@ -3403,6 +3555,12 @@ class _PytestFastHookSpecs:
         ``PYTEST_XDIST_WORKER`` / ``PYTEST_XDIST_WORKER_COUNT``."""
 
     @_pytest_fast_hookspec
+    def pytest_fast_worker_shutdown(self, config: Config, workerid: str) -> None:
+        """Fired once in every worker after its final fixture teardown and before its successful
+        completion frame. Plugins use it to flush process-local artifacts that ``os._exit`` would
+        otherwise discard. Raising rejects the run as incomplete."""
+
+    @_pytest_fast_hookspec
     def pytest_fast_annotate_result(self, item: Item, result: RunResult, extra: dict[str, object]) -> None:
         """Fired in the WORKER right after each test's runtest protocol completes — the bus channel
         for custom per-test measurements. ``result`` is the read side (outcome/duration/longrepr,
@@ -3418,9 +3576,7 @@ class _PytestFastHookSpecs:
 
 
 def pytest_addhooks(pluginmanager: pluggy.PluginManager) -> None:
-    """Register pytest-fast's own hookspecs so plugins may implement ``pytest_fast_configure_worker``
-    without a ``PluginValidationError``. Always registered (cheap); the hook only FIRES under
-    ``--worker-identity``."""
+    """Register pytest-fast's worker lifecycle and result-annotation hookspecs."""
     pluginmanager.add_hookspecs(_PytestFastHookSpecs)
 
 
