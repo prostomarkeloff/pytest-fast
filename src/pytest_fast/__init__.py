@@ -1191,6 +1191,16 @@ def _shutdown_worker_plugins(config: Config, wid: int) -> None:
     config.hook.pytest_fast_worker_shutdown(config=config, workerid=f"gw{wid}")
 
 
+def _batch_size_from_env() -> int:
+    """Resolve the master-side batch size: `PYTEST_FAST_BATCH` (default 32), clamped to >= 1.
+    An unparseable value falls back to the default. The knob exists to sweep the batch size
+    in the bus-overhead regime; it is NOT a public contract."""
+    try:
+        return max(1, int(os.environ.get("PYTEST_FAST_BATCH", "32")))
+    except ValueError:
+        return 32
+
+
 def _worker_main(
     wid: int,
     sock_path: str,
@@ -1242,59 +1252,26 @@ def _worker_main(
     run_start = time.perf_counter()
     busy = 0.0  # wall inside the runtest protocol
     cpu = 0.0  # this worker's CPU time over that same span (busy − cpu ≈ I/O wait)
-    bus_wait = 0.0  # idle between tests, waiting for the master to hand out the next index
+    bus_wait = 0.0  # idle between batches, waiting for the master to hand out the next indices
     ran = 0
-    prev: Item | None = None
-    prev_idx: int | None = None
-    pending: RunResult | None = None
     while True:
+        if active_items is not None:
+            active_items[wid] = _ACTIVE_ITEM_IDLE  # waiting for the next batch — no item active
         t_bus = time.perf_counter()
-        _send(sock, ("req", wid, pending))
-        if pending is not None and active_items is not None:
-            active_items[wid] = _ACTIVE_ITEM_IDLE
         reply, _ = _recv(sock)
-        bus_wait += time.perf_counter() - t_bus  # send result + wait for next idx = non-busy gap
+        bus_wait += time.perf_counter() - t_bus  # waiting for the next batch = non-busy gap
         # Master gone / malformed reply → break out and exit cleanly (os._exit below). The
         # master sees EOF and the run is flagged untrusted via the result undercount.
         if not isinstance(reply, tuple) or len(reply) < 2:
             break
-        idx_msg = cast("tuple[object, object]", reply)  # master → ('idx', pick)
-        idx = idx_msg[1]
-        cur = items[idx] if isinstance(idx, int) and 0 <= idx < len(items) else None
-        if prev is not None:
-            if active_items is not None and prev_idx is not None:
-                active_items[wid] = prev_idx
-            t0 = time.perf_counter()
-            c0 = time.process_time()
-            if faulthandler_mod is not None:
-                faulthandler_mod.dump_traceback_later(hang_timeout, repeat=True, exit=False)
-            try:
-                pending = _run_one_item(prev, cur, collector, full_report=full_report, profile=profile)
-            except BaseException:
-                if faulthandler_mod is not None:
-                    faulthandler_mod.cancel_dump_traceback_later()
-                # Worker died mid-test (runtime error in the protocol itself, NOT a test
-                # failure — those are captured as reports). Print the offending nodeid
-                # so the daemon log shows which test we were on, then re-raise so the
-                # process exits with non-zero and the master flags the run untrusted.
-                print(
-                    f"[pytest-fast] worker {wid} crashed while running {prev.nodeid!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                raise
-            if faulthandler_mod is not None:
-                faulthandler_mod.cancel_dump_traceback_later()
-            busy += time.perf_counter() - t0
-            cpu_this = time.process_time() - c0
-            cpu += cpu_this
-            pending["cpu"] = cpu_this  # per-test CPU → `bench` I/O-vs-CPU classification
-            if active_items is not None:
-                active_items[wid] = _ACTIVE_ITEM_COMPLETED
-            ran += 1
-        else:
-            pending = None
-        if cur is None:
+        picks = reply[1]  # master → ('batch', [pick, ...], hint)
+        if not isinstance(picks, list) or any(
+            not isinstance(pick, int) or not 0 <= pick < len(items) for pick in picks
+        ):
+            break  # corrupt batch — fin withheld → the undercount flags the run untrusted (fail-closed)
+        if not picks:
+            # End sentinel: the queue is drained. The final batch ran its last item with
+            # nextitem=None (full teardown), so fin carries just the stats.
             _shutdown_worker_plugins(config, wid)
             stats: WorkerStats = {
                 "wid": wid,
@@ -1304,12 +1281,54 @@ def _worker_main(
                 "bus_wait": bus_wait,
                 "run_wall": time.perf_counter() - run_start,
             }
-            _send(sock, ("fin", wid, pending, stats))
-            if pending is not None and active_items is not None:
-                active_items[wid] = _ACTIVE_ITEM_IDLE
+            _send(sock, ("fin", wid, None, stats))
             break
-        prev = cur
-        prev_idx = idx if isinstance(idx, int) else None
+        hint = reply[2] if len(reply) > 2 else None
+        hint_item = items[hint] if isinstance(hint, int) and 0 <= hint < len(items) else None
+        for position in range(len(picks)):
+            pick = cast("int", picks[position])
+            item = items[pick]
+            # The batch's last item runs against the hint — its TRUE next item, reserved
+            # by the master for this worker's next batch — or None at the end of the run
+            # (full teardown, exactly like the old ('idx', None)). Real-nextitem semantics
+            # keep module/session fixture behavior identical to the old per-item protocol.
+            nextitem = items[cast("int", picks[position + 1])] if position + 1 < len(picks) else hint_item
+            if active_items is not None:
+                active_items[wid] = pick
+            t0 = time.perf_counter()
+            c0 = time.process_time()
+            if faulthandler_mod is not None:
+                faulthandler_mod.dump_traceback_later(hang_timeout, repeat=True, exit=False)
+            try:
+                result = _run_one_item(item, nextitem, collector, full_report=full_report, profile=profile)
+            except BaseException:
+                if faulthandler_mod is not None:
+                    faulthandler_mod.cancel_dump_traceback_later()
+                # Worker died mid-test (runtime error in the protocol itself, NOT a test
+                # failure — those are captured as reports). Print the offending nodeid
+                # so the daemon log shows which test we were on, then re-raise so the
+                # process exits with non-zero and the master flags the run untrusted.
+                print(
+                    f"[pytest-fast] worker {wid} crashed while running {item.nodeid!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
+            if faulthandler_mod is not None:
+                faulthandler_mod.cancel_dump_traceback_later()
+            busy += time.perf_counter() - t0
+            cpu_this = time.process_time() - c0
+            cpu += cpu_this
+            result["cpu"] = cpu_this  # per-test CPU → `bench` I/O-vs-CPU classification
+            if active_items is not None:
+                active_items[wid] = _ACTIVE_ITEM_COMPLETED
+            ran += 1
+            # Ship the completed item IMMEDIATELY (per-item granularity, fire-and-forget):
+            # a crash in the next item must not take this result down with it — the compact
+            # runtime's exact crash evidence depends on every completed result reaching the
+            # master. The master refills this worker's batch as its outstanding drains, so
+            # the worker never blocks mid-batch (the batched direction is master → worker).
+            _send(sock, ("res", wid, result))
     sock.close()
     # Worker exit: `os._exit(0)` — skip atexit hooks AND non-daemon thread joins.
     # Returning normally would let interpreter shutdown join() every alive non-daemon
@@ -1526,6 +1545,11 @@ class Daemon:
         self.start_method = start_method
         self.dump_path = dump_path
         self.persist_workers = persist_workers
+        # Batch dispatch: how many item indices the master hands out per batch frame.
+        # Higher = fewer bus round-trips (n/K + W) — the win for suites of thousands of
+        # sub-ms tests, where the per-test round-trip dominates. 1 restores the old
+        # per-item protocol. Env-tunable (PYTEST_FAST_BATCH) for benchmarking sweeps.
+        self._batch_size = _batch_size_from_env()
         # Context + preload are created ONCE; the forkserver lazy-spawns on the first
         # Process.start() and collects tests there, subsequent forks reuse the ready items.
         # get_context(str) in typeshed → BaseContext (no .Process); at runtime the context
@@ -2445,6 +2469,44 @@ class Daemon:
                         report_conn = None  # controller gone — stop streaming, complete the run
                         return
 
+            # Per-worker flow control + lookahead reservation. The master refills a worker's
+            # batch only when its outstanding drains to zero (its res frames ack completion),
+            # so the worker never blocks mid-batch. Each batch frame carries a `hint` — the
+            # first item reserved for that worker's NEXT batch — so the batch's last item runs
+            # with its TRUE nextitem (exact fixture parity with the old per-item protocol:
+            # module/session fixtures stay warm across batch edges). A reservation is consumed
+            # as the next batch's first pick; a worker that dies with a reservation leaves an
+            # undercount → the run is flagged untrusted (fail-closed).
+            outstanding: dict[socket.socket, int] = {}
+            reserved: dict[socket.socket, int | None] = {}
+
+            def reserve_next() -> int | None:
+                nonlocal queue_pos
+                planned = len(pick_list) if pick_list is not None else (total or 0)
+                if abort_on_collect_errors and self._collect_errors:
+                    return None
+                if queue_pos >= planned:
+                    return None
+                pick = pick_list[queue_pos] if pick_list is not None else queue_pos
+                queue_pos += 1
+                return pick
+
+            def next_batch(conn: socket.socket) -> tuple[list[int], int | None]:
+                """Build the worker's next batch: its held reservation first, then fresh picks
+                up to `_batch_size`, then reserve one more as the lookahead hint."""
+                batch: list[int] = []
+                held = reserved.get(conn)
+                if held is not None:
+                    batch.append(held)
+                while len(batch) < self._batch_size:
+                    pick = reserve_next()
+                    if pick is None:
+                        break
+                    batch.append(pick)
+                hint = reserve_next()
+                reserved[conn] = hint
+                return batch, hint
+
             while active > 0:
                 for key, _mask in sel.select():
                     conn = key.fileobj
@@ -2476,36 +2538,57 @@ class Daemon:
                         ready_seen += 1
                         if ready_seen == expected:
                             t_ready = time.perf_counter()
-                    elif kind == "req":
-                        result = cast("RunResult | None", parts[2])
-                        if result is not None:
-                            results.append(result)
-                            emit_progress()
-                            emit_reports(result)
-                        if abort_on_collect_errors and self._collect_errors:
-                            pick = None
-                        elif pick_list is not None:
-                            pick = pick_list[queue_pos] if queue_pos < len(pick_list) else None
-                        else:
-                            pick = queue_pos if total is not None and queue_pos < total else None
-                        if pick is not None:
-                            queue_pos += 1
+                        # Hand this worker its first batch right away — the worker blocks on
+                        # recv after 'ready', so the master drives the protocol from here on.
+                        batch, hint = next_batch(conn)
+                        outstanding[conn] = len(batch)
                         try:
-                            tx += _send(conn, ("idx", pick))
+                            tx += _send(conn, ("batch", batch, hint))
                         except OSError:
-                            # Worker died after sending 'req' (rare). Treat as a disconnect and
-                            # finish the run — the result undercount (and the worker's nonzero
-                            # exitcode) flag it untrusted in _run_once, rather than crashing the daemon.
+                            reserved.pop(conn, None)
                             sel.unregister(conn)
                             conn.close()
                             active -= 1
                             continue
                         req_count += 1
-                    else:  # "fin"
+                    elif kind == "res":
+                        # Per-item result frame: every COMPLETED item ships immediately, so a
+                        # crash in a later item never takes earlier results down with it (exact
+                        # crash evidence for the compact runtime). Acking the res drains the
+                        # worker's outstanding; at zero the master refills the batch.
                         result = cast("RunResult | None", parts[2])
                         if result is not None:
                             results.append(result)
+                            emit_progress()
                             emit_reports(result)
+                        outstanding[conn] = max(0, outstanding.get(conn, 0) - 1)
+                        if outstanding[conn] == 0:
+                            batch, hint = next_batch(conn)
+                            outstanding[conn] = len(batch)
+                            try:
+                                tx += _send(conn, ("batch", batch, hint))
+                            except OSError:
+                                # Worker died after sending 'res' (rare). Treat as a disconnect
+                                # and finish the run — the result undercount (and the worker's
+                                # nonzero exitcode) flag it untrusted in _run_once, rather than
+                                # crashing the daemon.
+                                reserved.pop(conn, None)
+                                sel.unregister(conn)
+                                conn.close()
+                                active -= 1
+                                continue
+                            req_count += 1
+                    else:  # "fin"
+                        # Results all ship via 'res'; fin carries only the stats. The list
+                        # branch is defensive tolerance for a worker that shipped late.
+                        outstanding.pop(conn, None)
+                        reserved.pop(conn, None)
+                        fin_results = cast("list[RunResult] | None", parts[2])
+                        if fin_results:
+                            results.extend(fin_results)
+                            emit_progress()
+                            for fin_result in fin_results:
+                                emit_reports(fin_result)
                         worker_stats.append(cast("WorkerStats", parts[3]))
                         sel.unregister(conn)
                         conn.close()

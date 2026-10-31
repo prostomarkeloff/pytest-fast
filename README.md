@@ -247,10 +247,20 @@ client / pytest ─►   │  DAEMON (main process)               │
        ┌──────────────┬──────────┴───┬──────────────┐
        ▼              ▼              ▼              ▼
   WORKER 0       WORKER 1       WORKER 2       WORKER 3
-  inherit items+config (copy-on-write), pull a test index from the
-  master over a Unix socket (work-stealing), run pytest_runtest_protocol,
-  ship the result back — lean RunResult, or full serialized reports.
+  inherit items+config (copy-on-write), pull batches of test indices
+  from the master over a Unix socket (work-stealing, batch dispatch),
+  run pytest_runtest_protocol, ship each result back as it completes —
+  lean RunResult, or full serialized reports.
 ```
+
+Dispatch is **batched**: the master hands a worker up to `PYTEST_FAST_BATCH` (default 32)
+indices per frame and refills as the worker drains, so the worker never blocks between
+tests — the per-test bus round-trip that dominates suites of thousands of sub-ms tests is
+amortized ~K-fold. Each batch frame carries a lookahead hint (the first item reserved for
+that worker's *next* batch), so the batch's last test still runs with its true `nextitem`:
+module/session fixture behavior is byte-identical to per-item dispatch. Results still ship
+per-test the moment each completes — a worker crash cannot take completed results down with
+it (exact crash evidence for wrapper tools).
 
 `forkserver` is Python's stdlib `multiprocessing` start method that holds one clean, preloaded process and forks workers from it on demand. We set `set_forkserver_preload(["pytest_fast"])`; importing the package triggers `_collect()` at the bottom of `__init__.py`, so the forkserver process holds the collected items in its heap. Each worker is a `fork()` — **copy-on-write**, so items/config aren't re-allocated. `gc.freeze()` after collect moves everything to the permanent generation so GC doesn't dirty the COW pages.
 
@@ -337,6 +347,7 @@ If you need Windows or remote fan-out across machines — use xdist. If you spen
 | `PYTEST_FAST_TTL` | `600` | seconds | Daemon idle TTL for both front-ends. |
 | `PYTEST_FAST_WATCH_POLL` | `0.5` | seconds | `--fast-watch` watcher: interval between source `max(mtime)` polls. Lower = snappier pre-warm, slightly more CPU. |
 | `PYTEST_FAST_WATCH_DEBOUNCE` | `0.7` | seconds | `--fast-watch` watcher: quiet period after the last edit before it promotes a successor — one reboot per burst of edits. |
+| `PYTEST_FAST_BATCH` | `32` | int | Master-side dispatch batch: test indices handed to a worker per frame. Larger = fewer bus round-trips on suites of thousands of sub-ms tests; 1 restores per-item dispatch. Tuning knob, not a public contract. |
 | `OUTCOME_DUMP` | `""` | path | With `pytest -p pytest_fast`, writes `{nodeid: outcome}` JSON on sessionfinish — a reference dump for outcome-diff against xdist. |
 
 All listed variables are in the env fingerprint; changing any forces a fresh daemon (you never need to manually kill one).
