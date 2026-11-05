@@ -59,7 +59,7 @@ test-parity:
 
 # ── Atheris coverage-guided fuzzing (POSIX; libFuzzer) ───────────────────────────
 # Atheris is NOT a pyproject dependency: it targets py3.11–3.13 (the test matrix goes to
-# 3.14) and on macOS must be built against a libFuzzer-capable clang. So it's installed
+# 3.15) and on macOS must be built against a libFuzzer-capable clang. So it's installed
 # ad-hoc into the venv here. The corpus + tests/test_fuzz_corpus.py replay (which need NO
 # Atheris) are the durable per-PR guard; this is the deep, scheduled crash hunt.
 fuzz-install:
