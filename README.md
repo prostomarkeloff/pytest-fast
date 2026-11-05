@@ -618,7 +618,7 @@ There's also a **differential parity tier** (`@pytest.mark.parity`, `make test-p
 
 Deeper still, **`make fuzz`** runs [Atheris](https://github.com/google/atheris) (coverage-guided, libFuzzer-backed) against the pickle decoder — see [`fuzz/`](fuzz/). It already surfaced (and pinned regressions for) a decode-amplification OOM, a memo-index pre-allocation bomb, a whitelist class-as-value escape, and a memo-DAG traversal blow-up. Crashers it finds are curated into `fuzz/corpus/` and replayed on every PR by `tests/test_fuzz_corpus.py` — no Atheris required for the replay.
 
-CI runs lint, an `os: [ubuntu, macos, windows] × python: [3.11–3.14]` matrix for the unit suite (skipped on Windows — POSIX only), the fuzz + stress and parity tiers as dedicated `os: [ubuntu, macos]` jobs, and a nightly/​dispatch Atheris fuzzing job on Linux.
+CI runs lint, an `os: [ubuntu, macos, windows] × python: [3.11–3.15]` matrix for the unit suite (skipped on Windows — POSIX only), the fuzz + stress and parity tiers as dedicated `os: [ubuntu, macos]` jobs, and a nightly/​dispatch Atheris fuzzing job on Linux.
 
 ---
 
